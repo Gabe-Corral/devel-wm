@@ -1,0 +1,11 @@
+[package]
+name = "devel-wm"
+version = "0.1.0"
+edition = "2024"
+description = "A keyboard-first Wayland tiling compositor"
+publish = false
+
+[dependencies]
+smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit", "desktop", "wayland_frontend"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
