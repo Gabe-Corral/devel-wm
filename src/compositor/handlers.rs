@@ -2,13 +2,13 @@
 
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
-    desktop::{PopupKind, Window},
+    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
+    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    desktop::{LayerSurface as DesktopLayerSurface, PopupKind, Window, layer_map_for_output},
     input::{Seat, SeatHandler, SeatState},
     reexports::wayland_server::{
         Client, Resource,
-        protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
     utils::Serial,
     wayland::{
@@ -25,15 +25,28 @@ use smithay::{
                 set_data_device_focus,
             },
         },
+        shell::wlr_layer::{
+            Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler, WlrLayerShellState,
+        },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
+            XdgToplevelSurfaceData, decoration::XdgDecorationHandler,
         },
         shm::{ShmHandler, ShmState},
     },
 };
 
-use super::{Compositor, CompositorClient};
+use super::{Compositor, CompositorClient, LayerEntry};
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+
+fn same_layer_layout(a: LayerSurfaceCachedState, b: LayerSurfaceCachedState) -> bool {
+    a.size == b.size
+        && a.anchor == b.anchor
+        && a.exclusive_zone == b.exclusive_zone
+        && a.layer == b.layer
+        && (a.margin.top, a.margin.right, a.margin.bottom, a.margin.left)
+            == (b.margin.top, b.margin.right, b.margin.bottom, b.margin.left)
+}
 
 impl CompositorHandler for Compositor {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -49,25 +62,21 @@ impl CompositorHandler for Compositor {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        self.needs_repaint = true;
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-            if let Some(window) = self.space.elements().find(|window| {
-                window
-                    .toplevel()
-                    .is_some_and(|top| top.wl_surface() == &root)
-            }) {
-                window.on_commit();
-            }
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
         }
-        if let Some(window) = self.space.elements().find(|window| {
-            window
-                .toplevel()
-                .is_some_and(|top| top.wl_surface() == surface)
-        }) {
+        let visible = self.surface_affects_visible_scene(&root);
+        if let Some(perf) = self.perf.as_mut() {
+            perf.commit(visible);
+        }
+        self.needs_repaint |= visible;
+        if !is_sync_subsurface(surface)
+            && let Some(window) = self.surface_windows.get(&root)
+        {
+            window.on_commit();
+        }
+        if let Some(window) = self.surface_windows.get(surface) {
             let configured = with_states(surface, |states| {
                 states
                     .data_map
@@ -80,8 +89,21 @@ impl CompositorHandler for Compositor {
             if !configured {
                 window.toplevel().expect("toplevel").send_configure();
             }
+            self.refresh_toplevel_decoration(surface);
         }
         self.popups.commit(surface);
+        if let Some(entry) = self.layers.get_mut(surface) {
+            let current = entry.layer.cached_state();
+            let changed = !same_layer_layout(entry.layout_state, current);
+            entry.layout_state = current;
+            let output = entry.output.clone();
+            let layer = entry.layer.clone();
+            if changed {
+                layer_map_for_output(&output).arrange();
+                self.update_usable_area(&output);
+            }
+            layer.layer_surface().send_pending_configure();
+        }
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
         {
@@ -109,12 +131,18 @@ impl XdgShellHandler for Compositor {
         println!("xdg-shell toplevel connected");
         let window = Window::new_wayland_window(surface);
         self.register_window(&window);
-        self.space.map_element(window, (0, 0), true);
-        self.needs_repaint = true;
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.unregister_toplevel(surface.wl_surface());
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.refresh_toplevel_decoration(surface.wl_surface());
     }
 
     fn reposition_request(
@@ -131,6 +159,76 @@ impl XdgShellHandler for Compositor {
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+}
+
+impl XdgDecorationHandler for Compositor {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.set_decoration_mode(toplevel, DecorationMode::ServerSide);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        self.set_decoration_mode(toplevel, mode);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.set_decoration_mode(toplevel, DecorationMode::ServerSide);
+    }
+}
+
+impl Compositor {
+    fn set_decoration_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        toplevel.with_pending_state(|state| state.decoration_mode = Some(mode));
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+}
+
+impl WlrLayerShellHandler for Compositor {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        requested_output: Option<WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        let output = requested_output
+            .as_ref()
+            .and_then(smithay::output::Output::from_resource)
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(output) = output else {
+            return;
+        };
+        let layer = DesktopLayerSurface::new(surface, namespace);
+        if let Err(err) = layer_map_for_output(&output).map_layer(&layer) {
+            tracing::warn!("Could not map layer surface: {err}");
+            return;
+        }
+        self.layers.insert(
+            layer.wl_surface().clone(),
+            LayerEntry {
+                output: output.clone(),
+                layout_state: layer.cached_state(),
+                layer,
+            },
+        );
+        self.update_usable_area(&output);
+    }
+
+    fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
+        let _ = self.popups.track_popup(PopupKind::Xdg(popup));
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        if let Some(entry) = self.layers.remove(surface.wl_surface()) {
+            layer_map_for_output(&entry.output).unmap_layer(&entry.layer);
+            self.update_usable_area(&entry.output);
+        }
+    }
 }
 
 impl SeatHandler for Compositor {
@@ -168,6 +266,8 @@ impl OutputHandler for Compositor {}
 delegate_compositor!(Compositor);
 delegate_shm!(Compositor);
 delegate_xdg_shell!(Compositor);
+delegate_xdg_decoration!(Compositor);
+delegate_layer_shell!(Compositor);
 delegate_seat!(Compositor);
 delegate_data_device!(Compositor);
 delegate_output!(Compositor);

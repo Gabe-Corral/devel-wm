@@ -24,17 +24,20 @@ Check an item only after its stated behavior is verified. This tracks the standa
 
 ## 2. Layout and nested WM behavior
 
-- [ ] Implement deterministic master/stack geometry with configurable master ratio, master count, gaps, and borders; test multiple window counts and small usable areas.
-- [ ] Apply WM geometry to real xdg-shell surfaces, including configure/ack/commit behavior; map Smithay surfaces to window IDs.
-- [ ] Focus and raise windows correctly from keyboard and pointer input; avoid using Smithay `Space` as the source of WM ordering.
-- [ ] Support per-window floating alongside tiled windows; toggling from tiled starts at the on-screen tiled rectangle.
+- [x] Implement deterministic master/stack geometry from an output-local logical usable area, ordered tiled window IDs, and validated settings to window-ID/rectangle placements. Keep Smithay and scripting out of the calculation; test multiple window counts, small areas, invalid settings, and non-overlap.
+- [x] Apply WM geometry to real xdg-shell surfaces, including configure/ack/commit behavior; map Smithay surfaces to window IDs. Two Alacritty windows were confirmed tiling in the nested output.
+- [x] Focus and raise windows correctly from keyboard and pointer input; avoid using Smithay `Space` as the source of WM ordering. The focus/order workflow was manually confirmed in the nested output.
+- [x] Support per-window floating alongside tiled windows; toggling from tiled starts at the on-screen tiled rectangle. Floating and pointer-anchored dragging were manually confirmed in the nested output.
 - [ ] Implement Alt + left-button drag: convert tiled to floating at drag start, move with the pointer, and remain floating on release. Test cross-monitor ownership transfers in the pure core with two simulated monitors.
+- [ ] Negotiate server-side decorations with clients that support `xdg-decoration` so they omit their own titlebars. Handle clients that insist on client-side decorations without drawing a duplicate titlebar; verify behavior with both kinds of client.
+- [ ] Draw a simple i3-style top titlebar and border for each server-decorated window, showing the current xdg-toplevel title. Update on title and focus changes; include decoration height in layout, hit testing, and configure sizes, and omit the titlebar in fullscreen.
 - [ ] Verify with multiple clients that focus, workspace switching, moving, tiling, floating, close, and resize work in the nested backend.
 
 ## 3. Configuration and external control
 
 - [ ] Ship usable defaults with **Alt** as modifier, plus documented TOML overrides and duplicate/invalid keybinding detection.
-- [ ] Route keyboard actions and local IPC requests through the same typed commands.
+- [ ] Provide a documented, validated TOML color scheme for focused/unfocused titlebars, borders, and title text, with usable defaults. Verify configured colors render correctly and invalid colors produce clear errors.
+- [ ] Route keyboard actions and local IPC requests through the same typed, validated commands; return explicit errors for invalid targets. Keep this path usable without scripting.
 - [ ] Expose queries and change events for monitor-local workspaces, focus, windows, and layout; provide a small command client.
 - [ ] Limit IPC socket access to the current user and handle normal shutdown/stale sockets.
 
@@ -55,12 +58,30 @@ Check an item only after its stated behavior is verified. This tracks the standa
 - [ ] Complete a manual workflow test: launch terminal and browser, type and point, switch per-monitor workspaces, tile and float, drag between monitors, copy/paste, lock/unlock, unplug/replug an output, and exit cleanly.
 - [ ] Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`; keep pure WM/layout tests and real-client smoke tests meaningful.
 
+Decoration negotiation cannot forcibly remove titlebars drawn into a client's own buffer. The target is one compositor-drawn titlebar where the client supports server-side decorations, with a deliberate fallback for clients that do not.
+
 **MVP complete when:** the standalone compositor runs natively without an X11 host, provides working master/stack and floating windows on independent per-monitor workspaces, supports per-monitor external bars, and passes the workflow above. XWayland compatibility and additional layouts are follow-up decisions/features, not prerequisites silently implied by a successful nested prototype.
 
 ## After MVP: optional scripting and other ideas
 
-- [ ] Evaluate embedding [RustPython](https://github.com/RustPython/RustPython) for user automation. Prototype event delivery, typed-command requests, restart/recovery from exceptions and hung callbacks, and the effect on memory and responsiveness before selecting runtime isolation.
-- [ ] If the evaluation succeeds, provide an opt-in scripting API for window/workspace/output events and WM commands without replacing TOML defaults or blocking the compositor event loop.
-- [ ] Consider Python-defined layouts only after measuring latency and defining validation and Rust-layout fallback behavior.
+The proposed differentiator is **an inspectable, explainable, programmable developer desktop**, not merely using Python instead of Lua. Keep the MVP usable without Python; complete the native desktop and measure its baseline before adding a runtime.
 
-Detailed inspection, event history, developer sessions, and performance dashboards are also deferred until the core compositor is usable and its rendering behavior has been measured.
+### A. Establish an automation boundary
+
+- [ ] Define versioned, documented state snapshots, typed commands/results, and structured ordered events (with sequence numbers and stable process-lifetime IDs). Verify ordering, reconnect/resync, validation errors, and behavior when subscribers are slow. The current read-only IPC snapshots are a starting point, not the finished event API.
+- [ ] Provide optional process metadata (PID, executable, cwd, ancestry/cgroup where available) with provenance, missing-data/error states, and access controls. Test PID reuse, shared clients, short-lived processes, and windows whose creator is not their actual application; never infer window ownership or placement solely from a PID or cwd.
+- [ ] Record a bounded, privacy-conscious explanation of important policy decisions (for example, which rule placed a window), referencing the triggering event and applied command. Expose it for inspection without putting logging or external subscribers on the frame/input critical path.
+
+### B. Prototype safe Python automation
+
+- [ ] Compare [RustPython](https://github.com/RustPython/RustPython), a separately restartable Python process, and other practical runtimes against compatibility, memory, startup time, event latency, and failure isolation. Do not choose embedding solely because it is possible.
+- [ ] Prototype an opt-in Python client that reads snapshots/events and submits validated commands; prohibit direct access to Smithay objects or mutable WM internals. Force exceptions, infinite loops, slow handlers, and process crashes; demonstrate that input, rendering, built-in layouts, TOML defaults, and IPC remain usable.
+- [ ] Add safe script reload: validate and register new handlers before replacing old ones, retain the previous working automation on load failure, and report actionable errors. Do not promise rollback of commands already executed by an old script.
+
+### C. Prove a useful developer workflow
+
+- [ ] Build one end-to-end **open project** workflow: launch a terminal/editor for a project, associate their windows with a workspace using evidence that can be inspected or corrected, and manipulate the live result through a Python REPL. Explain why each window was assigned; validate behavior when process metadata is missing or wrong.
+- [ ] Evaluate save/reopen only as **relaunching applications and reconstructing intent**, not serializing/restoring Wayland surfaces. Test application failures, duplicate windows, and user overrides before considering general project/session management.
+- [ ] Measure overhead and recovery versus the no-Python baseline in terminal/browser use. Treat the feature as ready only if it delivers the workflow without stalls, lost commands, or a broken desktop after script failure; otherwise keep it experimental and opt-in.
+
+Python-defined layouts, detailed rendering diagnostics, richer inspection dashboards, and broader project APIs are later experiments: first validate results, deadlines, and a deterministic Rust-layout fallback. Do not make them prerequisites for master/stack or daily-driver usability.

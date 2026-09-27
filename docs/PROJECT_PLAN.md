@@ -25,7 +25,7 @@ The first development target is Manjaro Linux on X11/i3 using the Smithay 0.7.0 
 - **Compositor integration:** Smithay owns Wayland protocol objects, outputs, input, rendering, frame scheduling, and surface lifecycle. Keep an explicit mapping between Smithay surfaces and internal window IDs.
 - **Window-management core:** Store monitor-local workspace membership, focus order, tiling order, floating/fullscreen state, and commands independently of Smithay where practical. Treat Wayland focus and surface state as integration concerns, not as purely abstract data.
 - **Layout engine:** Given an available output rectangle, ordered windows, gap/border settings, and master ratio, produce non-overlapping rectangles. Account for output scale and reserved space when converting these to surface geometry.
-- **Command layer:** Route keybindings and IPC through the same validated commands; publish state changes for external consumers such as a bar.
+- **Command layer:** Route keybindings and IPC through the same validated commands; publish state changes for external consumers such as a bar. This becomes the future automation boundary too: scripts request commands rather than mutating WM state directly.
 - **Configuration:** Ship complete defaults. Parse and validate TOML settings and keybindings at startup. Add reload only once applying changes safely is defined.
 - **IPC:** Use a per-user Unix socket under `XDG_RUNTIME_DIR`, with access restricted to that user. Start with commands and state queries; add subscriptions when a bar needs them. Document the wire format and error responses.
 
@@ -87,11 +87,22 @@ The first development target is Manjaro Linux on X11/i3 using the Smithay 0.7.0 
 
 **Done when:** the defined application/workflow checklist passes on the target hardware for sustained use, with no known issue that prevents normal login, locking, input, or display recovery.
 
+### 6. Explore an inspectable, programmable developer desktop (after MVP)
+
+- Start with a versioned command/query/event contract: stable process-lifetime IDs, ordered events, explicit errors, subscriber backpressure and resync. Keep the pure Rust layout and WM policy independent of Smithay and any scripting runtime. Existing read-only IPC snapshots are only the first step.
+- Expose best-effort, access-controlled process context with provenance and uncertainty; a client PID/cwd is not proof of which application owns a window. Record bounded explanations for rule-driven placement so a user can inspect *why* something happened, not just its current state.
+- Prototype an opt-in Python client, interactive REPL, and reloadable event handlers using the same command/event contract as IPC and keybindings. Compare embedding RustPython with a restartable out-of-process worker; measure compatibility and overhead, and prove a hung/crashed handler cannot block the compositor. A successful reload replaces handlers only after validation; failures preserve the last working handlers.
+- Demonstrate one concrete project workflow: launch a terminal and editor, associate and organize their windows, inspect/correct any mistaken match in a REPL, and recover after script failure. Treat reopening a project as relaunching applications and rebuilding intent, not restoring Wayland surfaces.
+- Only after this vertical slice works, consider wider project/session APIs, richer renderer introspection, async subscriptions, or Python-defined layouts. A scripted layout needs validated geometry, a deadline, and a deterministic Rust fallback; it must not replace the built-in master/stack path.
+
+**Done when:** the opt-in workflow is useful and explainable, survives bad metadata, exceptions, infinite loops, and reload failures without losing desktop control, and has measured startup/memory/event-latency costs against the no-Python baseline. If isolation or performance fails, keep automation external/experimental rather than compromising the MVP.
+
 ## Scope boundaries
 
 - No animations, blur, shadows, rounded-corner effects, or custom shader effects in v1.
 - No i3-style split tree or dwm-style multi-tag views in v1; monocle can wait until after master/stack and floating work.
 - No built-in status bar: expose state over IPC and support external bars through layer-shell.
+- No mandatory Python runtime, process-based window identity, or scripted layout in the compositor's input/rendering path. These are post-MVP experiments behind the validated command/event boundary.
 - Direct scanout is a later optimization; first make GPU composition and frame scheduling correct.
 - Nested operation under X11 is a development harness; native Wayland operation is required for the standalone release.
 
@@ -104,6 +115,8 @@ The first development target is Manjaro Linux on X11/i3 using the Smithay 0.7.0 
 | Native graphics/input support takes longer than tiling | Finish the one-window vertical slice before expanding WM features |
 | Multi-monitor workspace semantics become ambiguous | Define which workspaces are visible per output before milestone 4 implementation |
 | Daily-driver protocols are underestimated | Track application workflows and required protocols in milestone 5 |
+| Python automation stalls or compromises the compositor | Measure baseline first; compare runtime isolation and inject hung/crashed scripts before offering it as supported |
+| Process metadata misidentifies a window or leaks private data | Treat it as optional evidence with provenance, uncertainty, and access controls; test misattribution and user corrections |
 
 ## Open decisions before implementation
 

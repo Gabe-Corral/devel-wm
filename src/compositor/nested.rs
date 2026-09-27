@@ -1,17 +1,20 @@
 //! Nested winit output: works as a window on an X11/i3 desktop.
 
-use std::{ffi::CStr, time::Duration};
+use std::{
+    ffi::CStr,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::{
         SwapBuffersError,
         renderer::{
             damage::OutputDamageTracker,
-            element::surface::WaylandSurfaceRenderElement,
             gles::{GlesRenderer, ffi},
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
+    desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
     utils::Transform,
@@ -19,7 +22,7 @@ use smithay::{
 
 use crate::LoopData;
 
-use super::Compositor;
+use super::{Compositor, decorations::WindowElements};
 
 pub struct NestedOutput {
     backend: WinitGraphicsBackend<GlesRenderer>,
@@ -44,27 +47,20 @@ impl NestedOutput {
         self.output
             .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
-        for window in state.space.elements() {
-            if let Some(top) = window.toplevel() {
-                top.with_pending_state(|pending| pending.size = Some(size.to_logical(1)));
-                top.send_pending_configure();
-            }
-        }
+        layer_map_for_output(&self.output).arrange();
+        state.update_usable_area(&self.output);
         self.request_redraw();
     }
 
-    fn repaint(&mut self, state: &Compositor) -> Result<(), SwapBuffersError> {
-        // Winit does not expose a reliable buffer age before bind here; a zero
-        // age correctly redraws the full output when a repaint is requested.
+    fn repaint(&mut self, state: &mut Compositor) -> Result<(), SwapBuffersError> {
+        let start = state.perf.as_ref().map(|_| Instant::now());
+        // Smithay exposes buffer age only after bind(), but its returned
+        // framebuffer borrows the backend so we cannot safely query it here.
+        // Zero is required until the backend offers age with the bind result.
         let age = 0;
         let damage = {
             let (renderer, mut framebuffer) = self.backend.bind()?;
-            smithay::desktop::space::render_output::<
-                _,
-                WaylandSurfaceRenderElement<GlesRenderer>,
-                _,
-                _,
-            >(
+            smithay::desktop::space::render_output::<_, WindowElements<GlesRenderer>, _, _>(
                 &self.output,
                 renderer,
                 &mut framebuffer,
@@ -80,12 +76,45 @@ impl NestedOutput {
             .cloned()
         };
 
+        let after_render = start.map(|_| Instant::now());
+
         tracing::debug!(damaged = damage.is_some(), "nested repaint");
-        if let Some(damage) = damage {
-            self.backend.submit(Some(&damage))?;
+        if let Some(ref damage) = damage {
+            self.backend.submit(Some(damage))?;
+        }
+        if let Some(start) = start {
+            let pixels = damage
+                .as_ref()
+                .map(|rects| {
+                    rects
+                        .iter()
+                        .map(|rect| (i64::from(rect.size.w) * i64::from(rect.size.h)).max(0) as u64)
+                        .sum()
+                })
+                .unwrap_or(0);
+            let output = self
+                .output
+                .current_mode()
+                .map(|mode| (i64::from(mode.size.w) * i64::from(mode.size.h)).max(0) as u64)
+                .unwrap_or(0);
+            state.perf.as_mut().expect("performance enabled").frame(
+                after_render.expect("render timer").duration_since(start),
+                Instant::now().duration_since(after_render.expect("render timer")),
+                pixels,
+                output,
+                damage.is_some(),
+            );
         }
         for window in state.space.elements() {
-            window.send_frame(
+            window.window.send_frame(
+                &self.output,
+                state.start_time.elapsed(),
+                Some(Duration::ZERO),
+                |_, _| Some(self.output.clone()),
+            );
+        }
+        for layer in layer_map_for_output(&self.output).layers() {
+            layer.send_frame(
                 &self.output,
                 state.start_time.elapsed(),
                 Some(Duration::ZERO),
