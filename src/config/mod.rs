@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn defaults_and_partial_overrides_preserve_unmentioned_actions() {
         let keys = Keybindings::parse(
-            "[keybindings]\nfocus-next = 'Super+h'\nswitch-workspace-2 = 'Super+2'\n",
+            "[keybindings]\nfocus-next = 'Super+h'\nswitch-workspace-2 = 'Super+2'\nshrink-master = 'Super+Left'\n",
         )
         .unwrap();
         assert_eq!(
@@ -339,6 +339,14 @@ mod tests {
         assert_eq!(
             keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_J)),
             Some(Action::SwapTile(Direction::Next))
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_Left)),
+            Some(Action::AdjustMasterRatio(Direction::Previous))
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_h)),
+            None
         );
     }
 

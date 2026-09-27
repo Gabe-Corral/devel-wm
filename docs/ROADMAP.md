@@ -40,6 +40,7 @@ Check an item only after its stated behavior is verified. This tracks the standa
 - [ ] Route keyboard actions and local IPC requests through the same typed, validated commands; return explicit errors for invalid targets. Keep this path usable without scripting.
 - [ ] Expose queries and change events for monitor-local workspaces, focus, windows, and layout; provide a small command client.
 - [ ] Limit IPC socket access to the current user and handle normal shutdown/stale sockets.
+- [ ] Before enabling write-capable IPC, authenticate local peers and authorize the narrow window/workspace commands exposed to them; test unauthorized requests. A private socket alone is not sufficient authorization for desktop control.
 
 ## 4. Native outputs and multi-monitor behavior
 
@@ -53,7 +54,8 @@ Check an item only after its stated behavior is verified. This tracks the standa
 ## 5. MVP desktop usability
 
 - [ ] Support per-output layer-shell bars and reserve their exclusive zones; verify separate bar instances can show each monitor's own IPC state.
-- [ ] Provide essential client behavior: cursor images, popups/grabs, clipboard/data-device, and any other protocols needed by the MVP test applications.
+- [x] Render a default cursor and client-provided cursor surfaces with hotspot in the nested output; verify the custom cursor from `bar-test` appears and restores on pointer leave.
+- [ ] Provide the remaining essential client behavior: popups/grabs, clipboard/data-device, and any other protocols needed by the MVP test applications. The client-owned clipboard and explicit xdg popup grabs are wired up; verify the [clipboard](CLIPBOARD.md) and [popup](POPUPS.md) smoke tests before marking this complete. Verify cursor behavior on the native backend separately.
 - [ ] Provide a working session-lock and unlock path for a native daily-driver session.
 - [ ] Complete a manual workflow test: launch terminal and browser, type and point, switch per-monitor workspaces, tile and float, drag between monitors, copy/paste, lock/unlock, unplug/replug an output, and exit cleanly.
 - [ ] Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`; keep pure WM/layout tests and real-client smoke tests meaningful.
@@ -62,26 +64,36 @@ Decoration negotiation cannot forcibly remove titlebars drawn into a client's ow
 
 **MVP complete when:** the standalone compositor runs natively without an X11 host, provides working master/stack and floating windows on independent per-monitor workspaces, supports per-monitor external bars, and passes the workflow above. XWayland compatibility and additional layouts are follow-up decisions/features, not prerequisites silently implied by a successful nested prototype.
 
-## After MVP: optional scripting and other ideas
+## After MVP: secure automation and optional scripting
 
-The proposed differentiator is **an inspectable, explainable, programmable developer desktop**, not merely using Python instead of Lua. Keep the MVP usable without Python; complete the native desktop and measure its baseline before adding a runtime.
+The proposed differentiator is **an inspectable, explainable, programmable developer desktop with a secure, language-neutral control plane**—not merely Python instead of Lua or an agent that guesses where to click. Human shortcuts, a CLI, Python, and AI agents should use the same validated policy. Keep the MVP usable without Python or an agent; complete the native desktop and measure its baseline before adding a runtime. The current read-only IPC is a starting point, not an authorized desktop-control API.
 
-### A. Establish an automation boundary
+### A. Establish a language-neutral automation boundary
 
-- [ ] Define versioned, documented state snapshots, typed commands/results, and structured ordered events (with sequence numbers and stable process-lifetime IDs). Verify ordering, reconnect/resync, validation errors, and behavior when subscribers are slow. The current read-only IPC snapshots are a starting point, not the finished event API.
+- [ ] Define versioned, documented state snapshots, queries, typed commands/results, and structured ordered events (with sequence numbers and stable process-lifetime IDs). Verify ordering, reconnect/resync, validation errors, and behavior when subscribers are slow. The current read-only IPC snapshots are a starting point, not the finished event API.
+- [ ] Make a CLI, Python wrapper/REPL, and an agent adapter clients of the **same** control interface; none may mutate Smithay objects or bypass Rust WM policy. Implement semantic operations such as selecting/focusing/closing a window or switching a workspace before resorting to synthetic keystrokes or coordinates. Resolve ambiguous app-id/title selectors explicitly; prefer stable window IDs for follow-up commands.
+- [ ] Support bounded event subscriptions and wait-for conditions (for example, launch an application, await its window-created event with a timeout, then act on its ID) without polling or blocking input/rendering. Test event loss, slow subscribers, disconnection, and resync.
 - [ ] Provide optional process metadata (PID, executable, cwd, ancestry/cgroup where available) with provenance, missing-data/error states, and access controls. Test PID reuse, shared clients, short-lived processes, and windows whose creator is not their actual application; never infer window ownership or placement solely from a PID or cwd.
 - [ ] Record a bounded, privacy-conscious explanation of important policy decisions (for example, which rule placed a window), referencing the triggering event and applied command. Expose it for inspection without putting logging or external subscribers on the frame/input critical path.
 
-### B. Prototype safe Python automation
+### B. Secure the control plane before expanding its powers
+
+- [ ] Threat-model untrusted local processes, compromised scripts, and agents. Authenticate each connection, default-deny sensitive operations, and enforce revocable capabilities for window/workspace read and control, process metadata, clipboard read/write, screenshot capture, keyboard/pointer injection, and application launch. Test cross-client data leaks, bypasses, stale/reused identities, revocation, and denial of service.
+- [ ] Scope sensitive access to explicit windows/workspaces/outputs where feasible, with user-visible consent and auditable decisions. Treat a workspace as a **policy scope**, not a proven security isolation boundary; verify what a client can actually observe before promising isolation. Do not expose an unrestricted Python interpreter or compositor internals over IPC.
+- [ ] Add screenshot, clipboard, application-launch, and synthetic-input APIs only as separately authorized capabilities after the underlying desktop features work. Prefer semantic WM operations; screenshots and input are fallbacks because the compositor cannot inherently see buttons or fields inside applications. Explore accessibility or application-specific semantics independently, without assuming Wayland surface metadata provides them.
+
+### C. Prototype safe Python automation
 
 - [ ] Compare [RustPython](https://github.com/RustPython/RustPython), a separately restartable Python process, and other practical runtimes against compatibility, memory, startup time, event latency, and failure isolation. Do not choose embedding solely because it is possible.
-- [ ] Prototype an opt-in Python client that reads snapshots/events and submits validated commands; prohibit direct access to Smithay objects or mutable WM internals. Force exceptions, infinite loops, slow handlers, and process crashes; demonstrate that input, rendering, built-in layouts, TOML defaults, and IPC remain usable.
+- [ ] Prototype an opt-in Python client of the control plane that reads snapshots/events and submits validated commands; prohibit direct access to Smithay objects or mutable WM internals. Force exceptions, infinite loops, slow handlers, and process crashes; demonstrate that input, rendering, built-in layouts, TOML defaults, and IPC remain usable. Embedding RustPython is optional, not the control API.
 - [ ] Add safe script reload: validate and register new handlers before replacing old ones, retain the previous working automation on load failure, and report actionable errors. Do not promise rollback of commands already executed by an old script.
 
-### C. Prove a useful developer workflow
+### D. Prove useful developer and agent workflows
 
 - [ ] Build one end-to-end **open project** workflow: launch a terminal/editor for a project, associate their windows with a workspace using evidence that can be inspected or corrected, and manipulate the live result through a Python REPL. Explain why each window was assigned; validate behavior when process metadata is missing or wrong.
 - [ ] Evaluate save/reopen only as **relaunching applications and reconstructing intent**, not serializing/restoring Wayland surfaces. Test application failures, duplicate windows, and user overrides before considering general project/session management.
 - [ ] Measure overhead and recovery versus the no-Python baseline in terminal/browser use. Treat the feature as ready only if it delivers the workflow without stalls, lost commands, or a broken desktop after script failure; otherwise keep it experimental and opt-in.
+- [ ] Demonstrate an agent using least-privilege, semantic commands and events to launch an application, await an unambiguous window, focus/move it, and recover from denial, timeout, and disconnect. Compare reliability against screenshot/coordinate-driven control without treating app internals as compositor-known state.
+- [ ] Explore dedicated agent workspaces or virtual outputs only after authorization, screenshot/input scoping, and isolation have been demonstrated. Test interference with human focus, clipboard, other workspaces, and physical outputs; do not make isolated agent sessions an MVP prerequisite.
 
 Python-defined layouts, detailed rendering diagnostics, richer inspection dashboards, and broader project APIs are later experiments: first validate results, deadlines, and a deterministic Rust-layout fallback. Do not make them prerequisites for master/stack or daily-driver usability.

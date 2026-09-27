@@ -4,7 +4,11 @@ use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
     delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
-    desktop::{LayerSurface as DesktopLayerSurface, PopupKind, Window, layer_map_for_output},
+    desktop::{
+        LayerSurface as DesktopLayerSurface, PopupKeyboardGrab, PopupKind, PopupPointerGrab,
+        Window, find_popup_root_surface, layer_map_for_output,
+    },
+    input::pointer::{CursorImageStatus, Focus},
     input::{Seat, SeatHandler, SeatState},
     reexports::wayland_server::{
         Client, Resource,
@@ -19,7 +23,7 @@ use smithay::{
         },
         output::OutputHandler,
         selection::{
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
@@ -71,6 +75,9 @@ impl CompositorHandler for Compositor {
             perf.commit(visible);
         }
         self.needs_repaint |= visible;
+        if matches!(&self.cursor.image, CursorImageStatus::Surface(cursor) if cursor == &root) {
+            self.needs_repaint = true;
+        }
         if !is_sync_subsurface(surface)
             && let Some(window) = self.surface_windows.get(&root)
         {
@@ -158,7 +165,50 @@ impl XdgShellHandler for Compositor {
         surface.send_repositioned(token);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat_resource: wl_seat::WlSeat, serial: Serial) {
+        let Some(seat) = Seat::from_resource(&seat_resource).filter(|seat| seat == &self.seat)
+        else {
+            return;
+        };
+        let popup = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&popup) else {
+            return;
+        };
+        let Some(keyboard) = seat.get_keyboard() else {
+            return;
+        };
+        // Do not let an unfocused client grab input. Nested popups may already
+        // have keyboard focus, so compare their root rather than the surface.
+        let focused_root = keyboard.current_focus().map(|focused| {
+            self.popups
+                .find_popup(&focused)
+                .and_then(|popup| find_popup_root_surface(&popup).ok())
+                .unwrap_or(focused)
+        });
+        if focused_root.as_ref() != Some(&root) {
+            tracing::debug!("denying popup grab without focus on its root");
+            return;
+        }
+        if !seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.has_grab(serial))
+            && self.last_forwarded_button_serial != Some(serial)
+            && self.last_forwarded_key_serial != Some(serial)
+        {
+            tracing::debug!("denying popup grab without a matching input serial");
+            return;
+        }
+        match self.popups.grab_popup(root, popup, &seat, serial) {
+            Ok(grab) => {
+                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+                if let Some(pointer) = seat.get_pointer() {
+                    pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+                }
+                self.popup_grab = Some(grab);
+            }
+            Err(error) => tracing::warn!(?error, "popup grab rejected"),
+        }
+    }
 }
 
 impl XdgDecorationHandler for Compositor {
@@ -239,11 +289,11 @@ impl SeatHandler for Compositor {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // A client may change the hotspot without changing the surface handle.
+        tracing::debug!(?image, "cursor image requested");
+        self.cursor.image = image;
+        self.needs_repaint = true;
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
@@ -253,6 +303,22 @@ impl SeatHandler for Compositor {
 
 impl SelectionHandler for Compositor {
     type SelectionUserData = ();
+
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        seat: Seat<Self>,
+    ) {
+        if ty == SelectionTarget::Clipboard {
+            self.clipboard_owner = source.and_then(|_| {
+                seat.get_keyboard()
+                    .and_then(|keyboard| keyboard.current_focus())
+                    .and_then(|surface| self.display_handle.get_client(surface.id()).ok())
+                    .map(|client| client.id())
+            });
+        }
+    }
 }
 impl DataDeviceHandler for Compositor {
     fn data_device_state(&self) -> &DataDeviceState {

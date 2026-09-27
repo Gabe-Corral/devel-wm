@@ -748,6 +748,26 @@ mod tests {
                 .thousandths(),
             650
         );
+        let tiled = wm.tiled_windows(first, WorkspaceId::FIRST).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        let before =
+            crate::layout::master_stack(area, tiled, crate::layout::LayoutSettings::default())
+                .unwrap();
+        let after = crate::layout::master_stack(
+            area,
+            tiled,
+            crate::layout::LayoutSettings {
+                master_ratio: wm.master_ratio(first, WorkspaceId::FIRST).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(after[0].content.width > before[0].content.width);
         assert_eq!(
             wm.master_ratio(second, WorkspaceId::FIRST)
                 .unwrap()

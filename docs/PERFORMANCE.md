@@ -68,6 +68,12 @@ earlier undecorated run; these are different effective workloads, so the
 numbers do **not** establish a rendering speedup. The benchmark now rejects
 zero-activity runs and warns on large commit-count differences.
 
+Two further five-second debug runs after the resize controls were added had
+299 and 301 client commits, 282 and 276 frames, and 0.59 s and 0.35 s
+compositor CPU respectively. This variation exceeds any defensible claim of
+an idle/active performance change from the controls; neither run exercised
+interactive resizing. Idle CPU was 0.0 s in both runs.
+
 Full-output redraw is **not solved**. Smithay 0.7's winit backend exposes
 `buffer_age()` only after `bind()`, but `bind()` returns a framebuffer that
 borrows the backend, preventing a safe age query before rendering. Guessing
@@ -75,3 +81,8 @@ an age risks stale pixels. The nested backend therefore continues to use age
 zero. A safe upstream API returning age with the framebuffer (or equivalent
 backend change), followed by correctness checks and matching before/after
 measurements, is needed before claiming partial-damage improvements.
+
+The software cursor now requests a repaint when it moves or its client image
+changes. On the nested backend, these frames still use the same full-output
+redraw path; the measurements above predate cursor rendering and must not be
+used as before/after cursor performance results.

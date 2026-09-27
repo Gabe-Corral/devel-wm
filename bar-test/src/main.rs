@@ -29,7 +29,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler, slot::SlotPool},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, QueueHandle,
@@ -93,7 +96,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit(); // Empty first commit requests the initial configure.
 
-    let pool = SlotPool::new(4, &shm)?;
+    let mut pool = SlotPool::new(4, &shm)?;
+    // Opt-in client cursor for exercising wl_pointer.set_cursor, including hotspot.
+    let cursor_test = if std::env::var("DEVEL_WM_CURSOR_TEST").as_deref() == Ok("1") {
+        let surface = compositor.create_surface(&qh);
+        let (buffer, pixels) = pool.create_buffer(12, 12, 48, wl_shm::Format::Argb8888)?;
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&0xff00ff00u32.to_le_bytes());
+        }
+        buffer.attach_to(&surface)?;
+        surface.damage_buffer(0, 0, 12, 12);
+        surface.commit();
+        Some((surface, buffer))
+    } else {
+        None
+    };
     let mut bar = Bar {
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &qh),
@@ -102,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         layer,
         pointer: None,
+        cursor_test,
         width: 0,
         height: HEIGHT,
         highlighted: false,
@@ -169,6 +187,7 @@ struct Bar {
     pool: SlotPool,
     layer: LayerSurface,
     pointer: Option<wl_pointer::WlPointer>,
+    cursor_test: Option<(wl_surface::WlSurface, Buffer)>,
     width: u32,
     height: u32,
     highlighted: bool,
@@ -350,10 +369,16 @@ impl PointerHandler for Bar {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
+            if &event.surface == self.layer.wl_surface()
+                && let PointerEventKind::Enter { serial } = event.kind
+                && let Some((surface, _buffer)) = &self.cursor_test
+            {
+                pointer.set_cursor(serial, Some(surface), 4, 5);
+            }
             if &event.surface == self.layer.wl_surface()
                 && let PointerEventKind::Press { button, .. } = event.kind
             {

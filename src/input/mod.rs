@@ -24,6 +24,9 @@ impl Compositor {
                 let keyboard = self.seat.get_keyboard().expect("keyboard");
                 let code = event.key_code();
                 let state = event.state();
+                if state == KeyState::Pressed {
+                    self.last_forwarded_key_serial = None;
+                }
                 let action = keyboard.input::<Option<Action>, _>(
                     self,
                     code,
@@ -35,6 +38,14 @@ impl Compositor {
                         {
                             return FilterResult::Intercept(None);
                         }
+                        // The popup keyboard grab owns input until the client
+                        // dismisses it; do not switch workspaces underneath it.
+                        if compositor.popup_grab.as_ref().is_some_and(|grab| !grab.has_ended()) {
+                            if state == KeyState::Pressed {
+                                compositor.last_forwarded_key_serial = Some(serial);
+                            }
+                            return FilterResult::Forward;
+                        }
                         let raw = key.raw_latin_sym_or_raw_current_sym();
                         if state == KeyState::Pressed {
                             tracing::debug!(?code, ?modifiers, ?raw, modified = ?key.modified_sym(), "nested key press");
@@ -45,6 +56,9 @@ impl Compositor {
                             compositor.intercepted_keys.insert(code);
                             FilterResult::Intercept(Some(action))
                         } else {
+                            if state == KeyState::Pressed {
+                                compositor.last_forwarded_key_serial = Some(serial);
+                            }
                             FilterResult::Forward
                         }
                     },
@@ -95,6 +109,8 @@ impl Compositor {
                 };
                 let pos = event.position_transformed(geometry.size) + geometry.loc.to_f64();
                 let pointer = self.seat.get_pointer().expect("pointer");
+                self.needs_repaint |= self.cursor_position != Some(pos);
+                self.cursor_position = Some(pos);
                 let pending_title_drag = self.move_title_drag(pos);
                 let dragging = self.is_floating_drag_active();
                 let resizing = self.is_floating_resize_active();
@@ -121,6 +137,10 @@ impl Compositor {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event, .. } => {
+                if event.state() == ButtonState::Pressed {
+                    self.last_forwarded_key_serial = None;
+                    self.last_forwarded_button_serial = None;
+                }
                 let pointer = self.seat.get_pointer().expect("pointer");
                 let serial = SERIAL_COUNTER.next_serial();
                 let end_move = event.button() == Some(MouseButton::Left)
@@ -209,6 +229,9 @@ impl Compositor {
                         self.focus_window(None, serial);
                     }
                 }
+                if event.state() == ButtonState::Pressed {
+                    self.last_forwarded_button_serial = Some(serial);
+                }
                 pointer.button(
                     self,
                     &ButtonEvent {
@@ -219,6 +242,31 @@ impl Compositor {
                     },
                 );
                 pointer.frame(self);
+                if event.state() == ButtonState::Pressed
+                    && self
+                        .popup_grab
+                        .as_ref()
+                        .is_some_and(|grab| grab.has_ended())
+                {
+                    self.popup_grab = None;
+                    let location = pointer.current_location();
+                    let target = self.surface_under(location).map(|(surface, _)| surface);
+                    let clicked =
+                        self.space
+                            .element_under(location)
+                            .and_then(|(window, origin)| {
+                                (window.title_hit(location - origin.to_f64())
+                                    || window
+                                        .window
+                                        .surface_under(
+                                            location - origin.to_f64(),
+                                            smithay::desktop::WindowSurfaceType::ALL,
+                                        )
+                                        .is_some_and(|(surface, _)| Some(surface) == target))
+                                .then(|| window.window.clone())
+                            });
+                    self.focus_window(clicked.as_ref(), serial);
+                }
             }
             InputEvent::PointerAxis { event, .. } => {
                 if self.is_floating_drag_active() {

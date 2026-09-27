@@ -17,12 +17,13 @@ use smithay::{
     desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
+    reexports::wayland_server::Resource,
     utils::Transform,
 };
 
 use crate::LoopData;
 
-use super::{Compositor, decorations::WindowElements};
+use super::{Compositor, cursor::CursorElements};
 
 pub struct NestedOutput {
     backend: WinitGraphicsBackend<GlesRenderer>,
@@ -60,14 +61,18 @@ impl NestedOutput {
         let age = 0;
         let damage = {
             let (renderer, mut framebuffer) = self.backend.bind()?;
-            smithay::desktop::space::render_output::<_, WindowElements<GlesRenderer>, _, _>(
+            let cursor = state
+                .cursor_position
+                .map(|position| state.cursor.elements(renderer, position))
+                .unwrap_or_default();
+            smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
                 &self.output,
                 renderer,
                 &mut framebuffer,
                 1.0,
                 age,
                 [&state.space],
-                &[],
+                &cursor,
                 &mut self.damage_tracker,
                 [0.1, 0.1, 0.1, 1.0],
             )
@@ -121,6 +126,17 @@ impl NestedOutput {
                 |_, _| Some(self.output.clone()),
             );
         }
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &state.cursor.image
+            && surface.is_alive()
+        {
+            smithay::desktop::utils::send_frames_surface_tree(
+                surface,
+                &self.output,
+                state.start_time.elapsed(),
+                Some(Duration::ZERO),
+                |_, _| Some(self.output.clone()),
+            );
+        }
         Ok(())
     }
 }
@@ -130,6 +146,7 @@ pub fn run_nested(
     data: &mut LoopData,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    backend.window().set_cursor_visible(false);
 
     let (vendor, renderer, version) = backend.renderer().with_context(|gl| unsafe {
         // SAFETY: the GL context is current for the duration of with_context.

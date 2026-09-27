@@ -309,6 +309,77 @@ mod tests {
         assert!(encode(&snapshot).ends_with('\n'));
     }
 
+    #[test]
+    fn moving_resized_float_back_leaves_second_workspace_vacant_in_snapshot() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let one = WorkspaceId::FIRST;
+        let two = WorkspaceId::new(2).unwrap();
+        let first = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: one,
+            })
+            .unwrap();
+        let second = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: one,
+            })
+            .unwrap();
+        let rect = crate::layout::Rect {
+            x: 40,
+            y: 50,
+            width: 320,
+            height: 240,
+        };
+        wm.execute(WmCommand::FloatFocusedAt { monitor, rect })
+            .unwrap();
+        wm.execute(WmCommand::ResizeFloating {
+            monitor,
+            window: second,
+            rect: crate::layout::Rect { width: 420, ..rect },
+        })
+        .unwrap();
+        wm.set_focus(monitor, Some(first));
+        wm.execute(WmCommand::FloatFocusedAt { monitor, rect })
+            .unwrap();
+        wm.execute(WmCommand::ResizeFloating {
+            monitor,
+            window: first,
+            rect: crate::layout::Rect {
+                height: 300,
+                ..rect
+            },
+        })
+        .unwrap();
+        wm.execute(WmCommand::MoveFocusedToWorkspace {
+            monitor,
+            workspace: two,
+        })
+        .unwrap();
+        wm.execute(WmCommand::SwitchWorkspace {
+            monitor,
+            workspace: two,
+        })
+        .unwrap();
+        wm.execute(WmCommand::MoveFocusedToWorkspace {
+            monitor,
+            workspace: one,
+        })
+        .unwrap();
+        let snapshot = Snapshot::from_wm(&wm, |_| "nested".to_owned());
+        let workspaces = &snapshot.monitors[0].workspaces;
+        assert_eq!(
+            workspaces.iter().find(|ws| ws.id == 1).unwrap().windows,
+            vec![second.number(), first.number()]
+        );
+        let vacant = workspaces.iter().find(|ws| ws.id == 2).unwrap();
+        assert!(!vacant.occupied);
+        assert!(vacant.windows.is_empty());
+        assert_eq!(vacant.focused_window, None);
+    }
+
     /// Run explicitly to compare the old per-workspace full scan with the
     /// workspace-owned order. This isolates IPC construction from rendering.
     #[test]

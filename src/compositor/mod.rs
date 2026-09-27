@@ -1,5 +1,6 @@
 //! Smithay integration: Wayland surfaces, outputs, and event loop.
 
+mod cursor;
 pub(crate) mod decorations;
 mod handlers;
 mod nested;
@@ -7,13 +8,13 @@ mod nested;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::Instant,
 };
 
 use smithay::{
     desktop::{
-        PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
+        PopupGrab, PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
         layer_map_for_output,
     },
     input::{Seat, SeatState},
@@ -29,7 +30,7 @@ use smithay::{
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::data_device::{DataDeviceState, clear_data_device_selection},
         shell::wlr_layer::WlrLayerShellState,
         shell::xdg::XdgShellState,
         shm::ShmState,
@@ -37,6 +38,7 @@ use smithay::{
     },
 };
 
+use cursor::Cursor;
 use decorations::{DecoratedWindow, insets};
 pub use nested::{NestedOutput, run_nested};
 
@@ -137,9 +139,12 @@ pub struct Compositor {
     layout_settings: LayoutSettings,
     pub(crate) keybindings: Keybindings,
     pub(crate) intercepted_keys: HashSet<smithay::input::keyboard::Keycode>,
+    pub(crate) last_forwarded_key_serial: Option<smithay::utils::Serial>,
+    pub(crate) last_forwarded_button_serial: Option<smithay::utils::Serial>,
     layers: HashMap<WlSurface, LayerEntry>,
     usable_areas: HashMap<smithay::output::Output, Rectangle<i32, Logical>>,
     pub popups: PopupManager,
+    pub(crate) popup_grab: Option<PopupGrab<Self>>,
     pub loop_signal: smithay::reexports::calloop::LoopSignal,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -149,10 +154,23 @@ pub struct Compositor {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    clipboard_owner: Option<ClientId>,
+    disconnected_clients: mpsc::Receiver<ClientId>,
     pub seat: Seat<Self>,
+    cursor: Cursor,
+    pub(crate) cursor_position: Option<Point<f64, Logical>>,
 }
 
 impl Compositor {
+    fn clear_disconnected_clipboard(&mut self) {
+        for client in self.disconnected_clients.try_iter() {
+            if self.clipboard_owner.as_ref() == Some(&client) {
+                self.clipboard_owner = None;
+                clear_data_device_selection(&self.display_handle, &self.seat);
+            }
+        }
+    }
+
     pub(crate) fn surface_affects_visible_scene(&self, root: &WlSurface) -> bool {
         if let Some(window) = self.surface_windows.get(root) {
             return self
@@ -208,6 +226,7 @@ impl Compositor {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let (disconnect_sender, disconnected_clients) = mpsc::channel();
         let mut seat = seat_state.new_wl_seat(&dh, "winit");
         seat.add_keyboard(Default::default(), 200, 25)?;
         seat.add_pointer();
@@ -216,11 +235,14 @@ impl Compositor {
         let socket_name = socket.socket_name().to_os_string();
         event_loop
             .handle()
-            .insert_source(socket, |stream, _, data| {
-                if let Err(err) = data
-                    .display_handle
-                    .insert_client(stream, Arc::new(CompositorClient::default()))
-                {
+            .insert_source(socket, move |stream, _, data| {
+                if let Err(err) = data.display_handle.insert_client(
+                    stream,
+                    Arc::new(CompositorClient {
+                        compositor_state: CompositorClientState::default(),
+                        disconnect_sender: disconnect_sender.clone(),
+                    }),
+                ) {
                     eprintln!("Failed to accept Wayland client: {err}");
                 }
             })?;
@@ -230,6 +252,7 @@ impl Compositor {
                 // SAFETY: the display remains inside this event source for its lifetime.
                 unsafe { display.get_mut().dispatch_clients(&mut data.compositor) }
                     .map_err(std::io::Error::other)?;
+                data.compositor.clear_disconnected_clipboard();
                 Ok(PostAction::Continue)
             },
         )?;
@@ -257,9 +280,12 @@ impl Compositor {
             layout_settings: LayoutSettings::default(),
             keybindings,
             intercepted_keys: HashSet::new(),
+            last_forwarded_key_serial: None,
+            last_forwarded_button_serial: None,
             layers: HashMap::new(),
             usable_areas: HashMap::new(),
             popups: PopupManager::default(),
+            popup_grab: None,
             loop_signal: event_loop.get_signal(),
             compositor_state,
             xdg_shell_state,
@@ -269,7 +295,11 @@ impl Compositor {
             output_manager_state,
             seat_state,
             data_device_state,
+            clipboard_owner: None,
+            disconnected_clients,
             seat,
+            cursor: Cursor::new(),
+            cursor_position: None,
         })
     }
 
@@ -387,9 +417,8 @@ impl Compositor {
             windows = placements.len(),
             "arranging master/stack"
         );
-        let mut tiled_moved = false;
         for placement in placements {
-            tiled_moved |= self.place_window(placement.window, placement.content);
+            self.place_window(placement.window, placement.content);
         }
         let floating = self
             .wm
@@ -399,18 +428,21 @@ impl Compositor {
         for id in floating {
             if let Some(rect) = self.wm.floating_rect(id) {
                 self.place_window(id, rect);
-                if tiled_moved && let Some(window) = self.scene_windows.get(&id) {
-                    self.space.raise_element(window, false);
-                }
             }
         }
     }
 
-    fn place_window(&mut self, id: WindowId, content: Rect) -> bool {
+    fn place_window(&mut self, id: WindowId, content: Rect) {
+        // Focus and decoration updates can arrive after a workspace transfer.
+        // Never let those paths put a hidden window back into the rendered Space.
+        if !self.wm.is_window_visible(id) {
+            return;
+        }
         let Some(window) = self.id_windows.get(&id) else {
-            return false;
+            return;
         };
         let scene = &self.scene_windows[&id];
+        let stacking_changed = scene.set_floating(self.wm.floating_rect(id).is_some());
         let decorated = window.toplevel().is_some_and(|top| {
             let state = top.current_state();
             state.decoration_mode == Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide)
@@ -443,6 +475,7 @@ impl Compositor {
         let position = (content.x, content.y);
         let previous = self.requested_geometry.insert(id, content);
         let mapped = self.mapped_windows.insert(id)
+            || stacking_changed
             || mode_changed
             || previous.is_some_and(|rect| (rect.x, rect.y) != position);
         if mapped {
@@ -468,7 +501,6 @@ impl Compositor {
             }
             self.needs_repaint = true;
         }
-        mapped
     }
 
     pub fn toggle_focused_floating(
@@ -716,7 +748,7 @@ impl Compositor {
                 if self.wm.is_window_visible(window)
                     && let Some(rect) = self.wm.floating_rect(window)
                 {
-                    let _ = self.place_window(window, rect);
+                    self.place_window(window, rect);
                 }
             }
             CommandEffect::WorkspaceSwitched { monitor }
@@ -756,6 +788,11 @@ impl Compositor {
         );
         pointer.frame(self);
         self.needs_repaint = true;
+        debug_assert!(
+            self.mapped_windows
+                .iter()
+                .all(|&id| self.wm.is_window_visible(id))
+        );
     }
 
     pub fn focus_window(&mut self, window: Option<&Window>, serial: smithay::utils::Serial) {
@@ -916,14 +953,16 @@ impl Compositor {
     }
 }
 
-#[derive(Default)]
 struct CompositorClient {
     compositor_state: CompositorClientState,
+    disconnect_sender: mpsc::Sender<ClientId>,
 }
 
 impl ClientData for CompositorClient {
     fn initialized(&self, _client_id: ClientId) {}
-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
+        let _ = self.disconnect_sender.send(client_id);
+    }
 }
 
 #[cfg(test)]

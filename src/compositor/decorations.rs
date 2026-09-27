@@ -60,6 +60,7 @@ fn paint_title(pixels: &mut [u8], width: i32, title: &str, focused: bool) {
 
 struct Decoration {
     enabled: bool,
+    floating: bool,
     title: String,
     focused: bool,
     width: i32,
@@ -72,6 +73,7 @@ impl Decoration {
     fn new() -> Self {
         Self {
             enabled: false,
+            floating: false,
             title: String::new(),
             focused: false,
             width: 1,
@@ -207,6 +209,15 @@ impl DecoratedWindow {
         self.decoration.lock().unwrap().enabled
     }
 
+    /// Floating windows live above tiled windows regardless of focus order.
+    /// Return whether Space needs to reinsert the element to sort by z-index.
+    pub fn set_floating(&self, floating: bool) -> bool {
+        let mut decoration = self.decoration.lock().unwrap();
+        let changed = decoration.floating != floating;
+        decoration.floating = floating;
+        changed
+    }
+
     pub fn title_hit(&self, point: Point<f64, Logical>) -> bool {
         if !self.decorated() {
             return false;
@@ -248,7 +259,11 @@ impl SpaceElement for DecoratedWindow {
     }
 
     fn z_index(&self) -> u8 {
-        SpaceElement::z_index(&self.window)
+        if self.decoration.lock().unwrap().floating {
+            1
+        } else {
+            0
+        }
     }
     fn set_activate(&self, activated: bool) {
         SpaceElement::set_activate(&self.window, activated);
