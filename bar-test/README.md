@@ -2,7 +2,7 @@
 
 This is a standalone test client for `devel-wm`, not the eventual status bar. It draws a 32-pixel top bar, requests a 32-pixel exclusive zone, and toggles color when clicked. With `DEVEL_WM_IPC` set, it subscribes to the [read-only state feed](../docs/IPC.md) and shows workspace numbers 1–9: blue for the active workspace, grey for occupied workspaces, and an amber underline for a workspace with remembered focus. It does not show a clock or issue commands when clicked.
 
-For a one-command nested launch with the correct Wayland and IPC sockets, run `scripts/run-with-bar.sh` from the repository root (or use its absolute path from elsewhere). Add `--alacritty 2` to launch two terminal windows as well. Ctrl-C or closing the compositor stops all processes launched by the script. To run the bar separately, follow the steps below.
+For a one-command nested launch with the correct Wayland and IPC sockets, run `scripts/run-with-bar.sh` from the repository root (or use its absolute path from elsewhere). Add `--alacritty 2` to launch two terminal windows as well. Ctrl-C or closing the compositor stops all processes launched by the script. For a separate Linux **text VT**, `scripts/run-native-with-bar.sh` explicitly starts an unlimited native session with one prototype bar; see [docs/NATIVE.md](../docs/NATIVE.md). To run the bar separately, follow the steps below.
 
 1. In one terminal at the repository root, run `cargo run --locked` and copy the `WAYLAND_DISPLAY` name it prints.
 2. In another terminal, run (replace `wayland-1` with that name):

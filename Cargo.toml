@@ -5,12 +5,17 @@ edition = "2024"
 description = "A keyboard-first Wayland tiling compositor"
 publish = false
 
+[features]
+native = ["smithay/backend_session_libseat", "smithay/backend_udev", "smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_libinput", "dep:signal-hook"]
+
 [dependencies]
-font8x8 = "0.3"
+ab_glyph = "0.2"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signal-hook = { version = "0.3", optional = true }
 toml = "0.8"
+xcursor = "0.3"
 smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit", "desktop", "wayland_frontend"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

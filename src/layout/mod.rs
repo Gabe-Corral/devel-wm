@@ -90,8 +90,10 @@ impl MasterRatio {
 pub struct LayoutSettings {
     pub master_ratio: MasterRatio,
     pub master_count: usize,
-    /// Logical pixels around tiles and between columns/rows.
-    pub gap: i32,
+    /// Logical pixels between tiled columns/rows.
+    pub inner_gap: i32,
+    /// Logical pixels between tiles and the usable output edges.
+    pub outer_gap: i32,
     /// Logical pixels inset from each tile frame to its client content.
     pub border: i32,
 }
@@ -101,7 +103,8 @@ impl Default for LayoutSettings {
         Self {
             master_ratio: MasterRatio(600),
             master_count: 1,
-            gap: 8,
+            inner_gap: 8,
+            outer_gap: 8,
             border: 2,
         }
     }
@@ -131,16 +134,7 @@ pub fn master_stack(
     tiled: &[WindowId],
     settings: LayoutSettings,
 ) -> Result<Vec<Placement>, LayoutError> {
-    if usable.width < 0
-        || usable.height < 0
-        || usable.x.checked_add(usable.width).is_none()
-        || usable.y.checked_add(usable.height).is_none()
-    {
-        return Err(LayoutError::InvalidArea);
-    }
-    if settings.master_count == 0 || settings.gap < 0 || settings.border < 0 {
-        return Err(LayoutError::InvalidSettings);
-    }
+    validate_layout(usable, settings)?;
     let count = i64::try_from(tiled.len()).map_err(|_| LayoutError::TooManyWindows)?;
     let master_count = tiled.len().min(settings.master_count);
     let mut result = Vec::with_capacity(tiled.len());
@@ -150,9 +144,10 @@ pub fn master_stack(
 
     let width = i64::from(usable.width);
     let height = i64::from(usable.height);
-    let gap = i64::from(settings.gap);
-    let outer_x = gap.min(width / 2);
-    let outer_y = gap.min(height / 2);
+    let inner_gap = i64::from(settings.inner_gap);
+    let outer_gap = i64::from(settings.outer_gap);
+    let outer_x = outer_gap.min(width / 2);
+    let outer_y = outer_gap.min(height / 2);
     let inner_x = i64::from(usable.x) + outer_x;
     let inner_y = i64::from(usable.y) + outer_y;
     let inner_width = width - 2 * outer_x;
@@ -169,7 +164,7 @@ pub fn master_stack(
             settings,
         )?;
     } else {
-        let column_gap = gap.min(inner_width);
+        let column_gap = inner_gap.min(inner_width);
         let shared_width = inner_width - column_gap;
         let master_width = shared_width * i64::from(settings.master_ratio.thousandths()) / 1000;
         place_column(
@@ -194,6 +189,93 @@ pub fn master_stack(
     Ok(result)
 }
 
+/// Equal-width columns in stable tile order, spanning the full usable height.
+pub fn side_by_side(
+    usable: Rect,
+    tiled: &[WindowId],
+    settings: LayoutSettings,
+) -> Result<Vec<Placement>, LayoutError> {
+    side_by_side_weighted(usable, tiled, &vec![1; tiled.len()], settings)
+}
+
+/// Like `side_by_side`, but preserves user-adjusted proportions across output
+/// size changes. Each weight follows its window rather than its slot.
+pub fn side_by_side_weighted(
+    usable: Rect,
+    tiled: &[WindowId],
+    weights: &[u32],
+    settings: LayoutSettings,
+) -> Result<Vec<Placement>, LayoutError> {
+    validate_layout(usable, settings)?;
+    if weights.len() != tiled.len() || weights.contains(&0) {
+        return Err(LayoutError::InvalidSettings);
+    }
+    let count = i64::try_from(tiled.len()).map_err(|_| LayoutError::TooManyWindows)?;
+    let mut result = Vec::with_capacity(tiled.len());
+    if count == 0 {
+        return Ok(result);
+    }
+
+    let width = i64::from(usable.width);
+    let height = i64::from(usable.height);
+    let outer_gap = i64::from(settings.outer_gap);
+    let outer_x = outer_gap.min(width / 2);
+    let outer_y = outer_gap.min(height / 2);
+    let inner_x = i64::from(usable.x) + outer_x;
+    let inner_y = i64::from(usable.y) + outer_y;
+    let inner_width = width - 2 * outer_x;
+    let inner_height = height - 2 * outer_y;
+    let gap = if count > 1 {
+        i64::from(settings.inner_gap).min(inner_width / (count - 1))
+    } else {
+        0
+    };
+    let pixels = inner_width - gap * (count - 1);
+    let total_weight: i128 = weights.iter().map(|&weight| i128::from(weight)).sum();
+    let mut left = inner_x;
+    let mut consumed_weight = 0;
+    let mut consumed_pixels = 0;
+    for (index, &weight) in weights.iter().enumerate() {
+        consumed_weight += i128::from(weight);
+        // Cumulative rounding distributes remainder pixels deterministically
+        // and guarantees the last column ends on the usable area's right edge.
+        let next_pixels =
+            i64::try_from((i128::from(pixels) * consumed_weight + total_weight - 1) / total_weight)
+                .map_err(|_| LayoutError::InvalidArea)?;
+        let column_width = next_pixels - consumed_pixels;
+        consumed_pixels = next_pixels;
+        place_column(
+            &mut result,
+            &tiled[index..index + 1],
+            left,
+            inner_y,
+            column_width,
+            inner_height,
+            settings,
+        )?;
+        left += column_width + gap;
+    }
+    Ok(result)
+}
+
+fn validate_layout(usable: Rect, settings: LayoutSettings) -> Result<(), LayoutError> {
+    if usable.width < 0
+        || usable.height < 0
+        || usable.x.checked_add(usable.width).is_none()
+        || usable.y.checked_add(usable.height).is_none()
+    {
+        return Err(LayoutError::InvalidArea);
+    }
+    if settings.master_count == 0
+        || settings.inner_gap < 0
+        || settings.outer_gap < 0
+        || settings.border < 0
+    {
+        return Err(LayoutError::InvalidSettings);
+    }
+    Ok(())
+}
+
 /// One pass per column, with fixed-point division and a single result allocation.
 fn place_column(
     out: &mut Vec<Placement>,
@@ -206,7 +288,7 @@ fn place_column(
 ) -> Result<(), LayoutError> {
     let count = i64::try_from(windows.len()).map_err(|_| LayoutError::TooManyWindows)?;
     let row_gap = if count > 1 {
-        i64::from(settings.gap).min(height / (count - 1))
+        i64::from(settings.inner_gap).min(height / (count - 1))
     } else {
         0
     };
@@ -366,7 +448,8 @@ mod tests {
     fn master_and_stack_use_ratio_and_stable_order() {
         let windows = ids(3);
         let settings = LayoutSettings {
-            gap: 4,
+            inner_gap: 4,
+            outer_gap: 4,
             border: 1,
             ..Default::default()
         };
@@ -402,12 +485,199 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_uses_equal_columns_and_both_gap_settings() {
+        let windows = ids(3);
+        let settings = LayoutSettings {
+            inner_gap: 4,
+            outer_gap: 6,
+            border: 2,
+            ..Default::default()
+        };
+        let placements = side_by_side(area(), &windows, settings).unwrap();
+        assert_eq!(
+            placements.iter().map(|p| p.window).collect::<Vec<_>>(),
+            windows
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.frame.x).collect::<Vec<_>>(),
+            [16, 47, 78]
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.frame.width).collect::<Vec<_>>(),
+            [27, 27, 26]
+        );
+        for placement in &placements {
+            assert_eq!(placement.frame.y, 26);
+            assert_eq!(placement.frame.height, 68);
+            assert_eq!(placement.content.x, placement.frame.x + 2);
+        }
+        assert_eq!(placements[2].frame.x + placements[2].frame.width, 104);
+    }
+
+    #[test]
+    fn side_by_side_zero_gaps_fill_usable_area_and_split_remainders() {
+        let windows = ids(3);
+        let settings = LayoutSettings {
+            inner_gap: 0,
+            outer_gap: 0,
+            ..Default::default()
+        };
+        let placements = side_by_side(area(), &windows, settings).unwrap();
+        assert_eq!(
+            placements.iter().map(|p| p.frame.x).collect::<Vec<_>>(),
+            [10, 44, 77]
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.frame.width).collect::<Vec<_>>(),
+            [34, 33, 33]
+        );
+        assert!(
+            placements
+                .iter()
+                .all(|p| p.frame.y == 20 && p.frame.height == 80)
+        );
+        assert_eq!(side_by_side(area(), &[], settings).unwrap(), []);
+        assert_eq!(
+            side_by_side(area(), &windows[..1], settings).unwrap()[0].frame,
+            area()
+        );
+    }
+
+    #[test]
+    fn weighted_columns_resize_only_neighbors_and_follow_output_size() {
+        let windows = ids(3);
+        let settings = LayoutSettings {
+            inner_gap: 0,
+            outer_gap: 0,
+            ..Default::default()
+        };
+        let before =
+            side_by_side_weighted(area(), &windows, &[1000, 1000, 1000], settings).unwrap();
+        let after = side_by_side_weighted(area(), &windows, &[1200, 800, 1000], settings).unwrap();
+        assert!(after[0].frame.width > before[0].frame.width);
+        assert!(after[1].frame.width < before[1].frame.width);
+        assert_eq!(after[2].frame.width, before[2].frame.width);
+        assert_eq!(
+            after[0].frame.width + after[1].frame.width,
+            before[0].frame.width + before[1].frame.width
+        );
+        let wider = side_by_side_weighted(
+            Rect {
+                width: 200,
+                ..area()
+            },
+            &windows,
+            &[1200, 800, 1000],
+            settings,
+        )
+        .unwrap();
+        assert_eq!(wider[2].frame.x + wider[2].frame.width, 210);
+        assert!(wider[0].frame.width > after[0].frame.width);
+        assert_eq!(
+            side_by_side_weighted(area(), &windows, &[1, 1], settings),
+            Err(LayoutError::InvalidSettings)
+        );
+        assert_eq!(
+            side_by_side_weighted(area(), &windows, &[1, 0, 1], settings),
+            Err(LayoutError::InvalidSettings)
+        );
+    }
+
+    #[test]
+    fn side_by_side_clamps_tiny_areas_and_rejects_invalid_settings() {
+        let windows = ids(8);
+        let settings = LayoutSettings {
+            inner_gap: 50,
+            outer_gap: 50,
+            border: 50,
+            ..Default::default()
+        };
+        for width in 0..=5 {
+            let area = Rect { width, ..area() };
+            let tiles = side_by_side(area, &windows, settings).unwrap();
+            assert_eq!(tiles.len(), windows.len());
+            for tile in tiles {
+                assert!(tile.frame.width >= 0 && tile.content.width >= 0);
+                assert!(tile.frame.x >= area.x);
+                assert!(tile.frame.x + tile.frame.width <= area.x + area.width);
+            }
+        }
+        assert_eq!(
+            side_by_side(
+                Rect {
+                    width: -1,
+                    ..area()
+                },
+                &windows,
+                settings
+            ),
+            Err(LayoutError::InvalidArea)
+        );
+        assert_eq!(
+            side_by_side(
+                area(),
+                &windows,
+                LayoutSettings {
+                    inner_gap: -1,
+                    ..settings
+                }
+            ),
+            Err(LayoutError::InvalidSettings)
+        );
+    }
+
+    #[test]
+    fn inner_and_outer_gaps_can_be_set_independently_or_disabled() {
+        let windows = ids(3);
+        let no_inner = master_stack(
+            area(),
+            &windows,
+            LayoutSettings {
+                inner_gap: 0,
+                outer_gap: 10,
+                border: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(no_inner[0].frame.x, 20);
+        assert_eq!(no_inner[0].frame.width, 48);
+        assert_eq!(no_inner[1].frame.x, 68);
+        assert_eq!(no_inner[1].frame.y, 30);
+        assert_eq!(no_inner[2].frame.y, 60);
+        assert_eq!(no_inner[1].frame.x + no_inner[1].frame.width, 100);
+
+        let no_outer = master_stack(
+            area(),
+            &windows,
+            LayoutSettings {
+                inner_gap: 12,
+                outer_gap: 0,
+                border: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(no_outer[0].frame.x, 10);
+        assert_eq!(
+            no_outer[1].frame.x - (no_outer[0].frame.x + no_outer[0].frame.width),
+            12
+        );
+        assert_eq!(
+            no_outer[2].frame.y - (no_outer[1].frame.y + no_outer[1].frame.height),
+            12
+        );
+        assert_eq!(no_outer[1].frame.x + no_outer[1].frame.width, 110);
+    }
+
+    #[test]
     fn multiple_masters_and_uneven_pixels() {
         let windows = ids(5);
         let settings = LayoutSettings {
             master_count: 2,
             master_ratio: MasterRatio::new(500).unwrap(),
-            gap: 1,
+            inner_gap: 1,
+            outer_gap: 1,
             border: 0,
         };
         let result = master_stack(
@@ -435,7 +705,8 @@ mod tests {
     fn tiny_areas_clamp_gaps_and_borders_without_negative_geometry() {
         let windows = ids(6);
         let settings = LayoutSettings {
-            gap: 100,
+            inner_gap: 100,
+            outer_gap: 100,
             border: 100,
             ..Default::default()
         };
@@ -494,7 +765,8 @@ mod tests {
                     let settings = LayoutSettings {
                         master_ratio: MasterRatio::new(ratio).unwrap(),
                         master_count: 2,
-                        gap: 3,
+                        inner_gap: 3,
+                        outer_gap: 3,
                         border: 1,
                     };
                     let first = master_stack(usable, &windows[..count], settings).unwrap();
@@ -571,7 +843,18 @@ mod tests {
                 area(),
                 &windows,
                 LayoutSettings {
-                    gap: -1,
+                    inner_gap: -1,
+                    ..defaults
+                }
+            ),
+            Err(LayoutError::InvalidSettings)
+        );
+        assert_eq!(
+            master_stack(
+                area(),
+                &windows,
+                LayoutSettings {
+                    outer_gap: -1,
                     ..defaults
                 }
             ),

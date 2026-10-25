@@ -15,6 +15,7 @@ use smithay::{
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::layer_map_for_output,
+    input::pointer::CursorIcon,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
     reexports::wayland_server::Resource,
@@ -63,7 +64,14 @@ impl NestedOutput {
             let (renderer, mut framebuffer) = self.backend.bind()?;
             let cursor = state
                 .cursor_position
-                .map(|position| state.cursor.elements(renderer, position))
+                .map(|position| {
+                    let icon = state
+                        .column_resize_cursor_at(position)
+                        .then_some(CursorIcon::EwResize);
+                    state
+                        .cursor
+                        .elements(renderer, position.to_physical(1.0), 1.0, icon)
+                })
                 .unwrap_or_default();
             smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
                 &self.output,

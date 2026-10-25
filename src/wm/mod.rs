@@ -65,6 +65,17 @@ pub enum AddWindowError {
 /// Policy operations; keyboard shortcuts and future IPC translate into these.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WmCommand {
+    ToggleTilingMode {
+        monitor: MonitorId,
+    },
+    ResizeColumnPair {
+        monitor: MonitorId,
+        left: WindowId,
+        right: WindowId,
+        left_width: i32,
+        right_width: i32,
+        delta: i32,
+    },
     SwitchWorkspace {
         monitor: MonitorId,
         workspace: WorkspaceId,
@@ -102,6 +113,14 @@ pub enum WmCommand {
         x: i32,
         y: i32,
     },
+    /// Keep the window floating while assigning it to the destination's
+    /// currently visible workspace and transferring keyboard focus.
+    TransferFloating {
+        window: WindowId,
+        destination: MonitorId,
+        x: i32,
+        y: i32,
+    },
     ResizeFloating {
         monitor: MonitorId,
         window: WindowId,
@@ -113,6 +132,13 @@ pub enum WmCommand {
 pub enum Direction {
     Previous,
     Next,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TilingMode {
+    #[default]
+    MasterStack,
+    SideBySide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +175,11 @@ pub enum CommandEffect {
         monitor: MonitorId,
         window: WindowId,
     },
+    WindowTransferred {
+        from: MonitorId,
+        to: MonitorId,
+        window: WindowId,
+    },
 }
 
 struct WorkspaceState {
@@ -156,6 +187,8 @@ struct WorkspaceState {
     tiled: Vec<WindowId>,
     floating: Vec<WindowId>,
     master_ratio: MasterRatio,
+    tiling_mode: TilingMode,
+    column_weights: BTreeMap<WindowId, u32>,
 }
 
 impl Default for WorkspaceState {
@@ -165,6 +198,8 @@ impl Default for WorkspaceState {
             tiled: Vec::new(),
             floating: Vec::new(),
             master_ratio: MasterRatio::new(600).expect("valid default ratio"),
+            tiling_mode: TilingMode::default(),
+            column_weights: BTreeMap::new(),
         }
     }
 }
@@ -181,6 +216,7 @@ impl WorkspaceState {
             .position(|&id| id == window)
             .expect("registered window");
         order.remove(index);
+        self.column_weights.remove(&window);
         if self.focused_window == Some(window) {
             self.focused_window = successor(order, index).or_else(|| other.last().copied());
         }
@@ -299,6 +335,27 @@ impl WmState {
         )
     }
 
+    pub fn tiling_mode(&self, monitor: MonitorId, workspace: WorkspaceId) -> Option<TilingMode> {
+        Some(
+            self.monitors
+                .get(&monitor)?
+                .workspaces
+                .get(&workspace)?
+                .tiling_mode,
+        )
+    }
+
+    pub fn column_weights(&self, monitor: MonitorId, workspace: WorkspaceId) -> Option<Vec<u32>> {
+        let state = self.monitors.get(&monitor)?.workspaces.get(&workspace)?;
+        Some(
+            state
+                .tiled
+                .iter()
+                .map(|id| state.column_weights.get(id).copied().unwrap_or(1000))
+                .collect(),
+        )
+    }
+
     /// Select an existing monitor as the keyboard-focus source.
     pub fn set_active_monitor(&mut self, monitor: MonitorId) -> bool {
         if !self.monitors.contains_key(&monitor) {
@@ -306,6 +363,123 @@ impl WmState {
         }
         self.active_monitor = Some(monitor);
         true
+    }
+
+    /// On loss of a monitor, keep its workspace definitions but migrate all
+    /// windows (including those on inactive workspaces) to the surviving
+    /// monitor's visible workspace. With no survivor, leave everything intact.
+    pub fn evacuate_monitor(
+        &mut self,
+        source: MonitorId,
+        survivor: Option<(MonitorId, Rect)>,
+    ) -> Result<(), CommandError> {
+        if !self.monitors.contains_key(&source) {
+            return Err(CommandError::UnknownMonitor);
+        }
+        let Some((target, area)) = survivor else {
+            return Ok(());
+        };
+        if source == target
+            || !self.monitors.contains_key(&target)
+            || area.width <= 0
+            || area.height <= 0
+        {
+            return Err(CommandError::UnknownMonitor);
+        }
+        let workspace = self.active_workspace(target).expect("validated monitor");
+        let focused = self
+            .active_workspace(source)
+            .and_then(|ws| self.focused_window(source, ws));
+        let moving: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(_, owner)| owner.monitor == source)
+            .map(|(&id, &owner)| (id, owner.workspace, self.floating_rects.contains_key(&id)))
+            .collect();
+        for &(id, from_workspace, floating) in &moving {
+            let from = self
+                .monitors
+                .get_mut(&source)
+                .expect("known source")
+                .workspaces
+                .get_mut(&from_workspace)
+                .expect("window workspace");
+            from.remove_window(id, floating);
+            if let Some(rect) = self.floating_rects.get_mut(&id) {
+                *rect = clamp_floating_to_area(*rect, area);
+            }
+            if let Some(rect) = self.saved_floating_rects.get_mut(&id) {
+                *rect = clamp_floating_to_area(*rect, area);
+            }
+            self.windows
+                .get_mut(&id)
+                .expect("registered window")
+                .monitor = target;
+            self.windows
+                .get_mut(&id)
+                .expect("registered window")
+                .workspace = workspace;
+            let dest = self
+                .monitors
+                .get_mut(&target)
+                .expect("known destination")
+                .workspaces
+                .get_mut(&workspace)
+                .expect("active workspace");
+            if floating {
+                dest.floating.push(id);
+            } else {
+                dest.tiled.push(id);
+            }
+        }
+        if let Some(focused) = focused.filter(|_| self.active_monitor == Some(source)) {
+            self.monitors
+                .get_mut(&target)
+                .expect("known destination")
+                .workspaces
+                .get_mut(&workspace)
+                .expect("active workspace")
+                .focused_window = Some(focused);
+        }
+        if self.active_monitor == Some(source) {
+            self.active_monitor = Some(target);
+        }
+        Ok(())
+    }
+
+    /// Preserve floating positions relative to a monitor when its logical
+    /// origin shifts after a neighbor is removed or reattached.
+    pub fn shift_monitor_floats(&mut self, monitor: MonitorId, dx: i32, dy: i32, area: Rect) {
+        for (&id, rect) in &mut self.floating_rects {
+            if self
+                .windows
+                .get(&id)
+                .is_some_and(|owner| owner.monitor == monitor)
+            {
+                let shifted = Rect {
+                    x: rect.x.saturating_add(dx),
+                    y: rect.y.saturating_add(dy),
+                    ..*rect
+                };
+                *rect = clamp_floating_to_area(shifted, area);
+            }
+        }
+        for (&id, rect) in &mut self.saved_floating_rects {
+            if self
+                .windows
+                .get(&id)
+                .is_some_and(|owner| owner.monitor == monitor)
+            {
+                *rect = clamp_floating_to_area(
+                    Rect {
+                        x: rect.x.saturating_add(dx),
+                        y: rect.y.saturating_add(dy),
+                        ..*rect
+                    },
+                    area,
+                );
+            }
+        }
     }
 
     pub fn active_workspace(&self, monitor: MonitorId) -> Option<WorkspaceId> {
@@ -326,6 +500,63 @@ impl WmState {
 
     pub fn execute(&mut self, command: WmCommand) -> Result<CommandEffect, CommandError> {
         match command {
+            WmCommand::ToggleTilingMode { monitor } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                active.tiling_mode = match active.tiling_mode {
+                    TilingMode::MasterStack => TilingMode::SideBySide,
+                    TilingMode::SideBySide => TilingMode::MasterStack,
+                };
+                Ok(CommandEffect::LayoutChanged { monitor })
+            }
+            WmCommand::ResizeColumnPair {
+                monitor,
+                left,
+                right,
+                left_width,
+                right_width,
+                delta,
+            } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                if active.tiling_mode != TilingMode::SideBySide {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                if !active.tiled.windows(2).any(|pair| pair == [left, right]) {
+                    return Err(CommandError::UnknownWindow);
+                }
+                if left_width <= 0 || right_width <= 0 {
+                    return Err(CommandError::InvalidGeometry);
+                }
+                let pair_width = i64::from(left_width) + i64::from(right_width);
+                let minimum = 80_i64.min(pair_width / 2);
+                let width =
+                    (i64::from(left_width) + i64::from(delta)).clamp(minimum, pair_width - minimum);
+                let old_left = active.column_weights.get(&left).copied().unwrap_or(1000);
+                let old_right = active.column_weights.get(&right).copied().unwrap_or(1000);
+                let sum = u64::from(old_left) + u64::from(old_right);
+                let left_weight = ((width as u64 * sum + pair_width as u64 / 2) / pair_width as u64)
+                    .clamp(1, sum - 1) as u32;
+                let right_weight = (sum - u64::from(left_weight)) as u32;
+                if left_weight == old_left && right_weight == old_right {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                active.column_weights.insert(left, left_weight);
+                active.column_weights.insert(right, right_weight);
+                Ok(CommandEffect::LayoutChanged { monitor })
+            }
             WmCommand::SwitchWorkspace { monitor, workspace } => {
                 if !self.monitors.contains_key(&monitor) {
                     return Err(CommandError::UnknownMonitor);
@@ -467,7 +698,7 @@ impl WmState {
                     .workspaces
                     .get_mut(&state.active_workspace)
                     .expect("active workspace");
-                if active.tiled.len() < 2 {
+                if active.tiled.len() < 2 || active.tiling_mode != TilingMode::MasterStack {
                     return Ok(CommandEffect::Unchanged);
                 }
                 let delta = match direction {
@@ -571,6 +802,68 @@ impl WmState {
                 rect.x = x;
                 rect.y = y;
                 Ok(CommandEffect::GeometryChanged { monitor, window })
+            }
+            WmCommand::TransferFloating {
+                window,
+                destination,
+                x,
+                y,
+            } => {
+                let owner = *self
+                    .windows
+                    .get(&window)
+                    .ok_or(CommandError::UnknownWindow)?;
+                let target_workspace = self
+                    .active_workspace(destination)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let rect = self
+                    .floating_rects
+                    .get(&window)
+                    .ok_or(CommandError::NotFloating)?;
+                if x.checked_add(rect.width).is_none() || y.checked_add(rect.height).is_none() {
+                    return Err(CommandError::InvalidGeometry);
+                }
+                if owner.monitor == destination {
+                    return self.execute(WmCommand::MoveFloating {
+                        monitor: destination,
+                        window,
+                        x,
+                        y,
+                    });
+                }
+                let source = self
+                    .monitors
+                    .get_mut(&owner.monitor)
+                    .expect("window's monitor must exist")
+                    .workspaces
+                    .get_mut(&owner.workspace)
+                    .expect("window's workspace must exist");
+                source.remove_window(window, true);
+                let target = self
+                    .monitors
+                    .get_mut(&destination)
+                    .expect("validated destination")
+                    .workspaces
+                    .get_mut(&target_workspace)
+                    .expect("active workspace must exist");
+                target.floating.push(window);
+                target.focused_window = Some(window);
+                self.active_monitor = Some(destination);
+                *self.windows.get_mut(&window).expect("known window") = WindowOwner {
+                    monitor: destination,
+                    workspace: target_workspace,
+                };
+                let rect = self
+                    .floating_rects
+                    .get_mut(&window)
+                    .expect("floating window");
+                rect.x = x;
+                rect.y = y;
+                Ok(CommandEffect::WindowTransferred {
+                    from: owner.monitor,
+                    to: destination,
+                    window,
+                })
             }
             WmCommand::ResizeFloating {
                 monitor,
@@ -711,9 +1004,368 @@ fn valid_floating_rect(rect: Rect) -> bool {
         && rect.y.checked_add(rect.height).is_some()
 }
 
+fn clamp_floating_to_area(rect: Rect, area: Rect) -> Rect {
+    let axis = |start: i32, size: i32, edge: i32, extent: i32| {
+        let visible = 32.min(size).min(extent);
+        let min = i64::from(edge) + i64::from(visible) - i64::from(size);
+        let max = i64::from(edge) + i64::from(extent) - i64::from(visible);
+        i64::from(start)
+            .clamp(min, max)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX) - i64::from(size)) as i32
+    };
+    Rect {
+        x: axis(rect.x, rect.width, area.x, area.width),
+        y: axis(rect.y, rect.height, area.y, area.height),
+        ..rect
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_migrates_every_workspace_to_survivor_and_preserves_floats() {
+        let mut wm = WmState::new();
+        let first = wm.add_monitor();
+        let second = wm.add_monitor();
+        let hidden = WorkspaceId::new(2).unwrap();
+        let survivor_workspace = WorkspaceId::new(3).unwrap();
+        wm.set_active_workspace(second, survivor_workspace);
+        let resident = wm
+            .add_window(WindowOwner {
+                monitor: second,
+                workspace: survivor_workspace,
+            })
+            .unwrap();
+        let focused = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let float_rect = Rect {
+            x: -300,
+            y: 1200,
+            width: 280,
+            height: 240,
+        };
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor: first,
+            rect: float_rect,
+        })
+        .unwrap();
+        wm.add_workspace(first, hidden);
+        let hidden_window = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: hidden,
+            })
+            .unwrap();
+        let area = Rect {
+            x: 3840,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        wm.evacuate_monitor(first, Some((second, area))).unwrap();
+        assert_eq!(wm.active_monitor(), Some(second));
+        assert_eq!(wm.keyboard_focus(), Some(focused));
+        assert_eq!(
+            wm.owner(focused),
+            Some(WindowOwner {
+                monitor: second,
+                workspace: survivor_workspace
+            })
+        );
+        assert_eq!(wm.owner(hidden_window), wm.owner(focused));
+        assert_eq!(
+            wm.floating_rect(focused),
+            Some(Rect {
+                x: 3592,
+                y: 1048,
+                ..float_rect
+            })
+        );
+        assert_eq!(
+            wm.floating_windows(second, survivor_workspace),
+            Some(&[focused][..])
+        );
+        assert_eq!(
+            wm.tiled_windows(second, survivor_workspace),
+            Some(&[resident, hidden_window][..])
+        );
+        assert_eq!(wm.tiled_windows(first, hidden), Some(&[][..]));
+        assert_eq!(wm.windows().count(), 3);
+    }
+
+    #[test]
+    fn all_outputs_gone_keeps_windows_and_focus_for_reconnection() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let window = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        wm.evacuate_monitor(monitor, None).unwrap();
+        assert_eq!(
+            wm.owner(window),
+            Some(WindowOwner {
+                monitor,
+                workspace: WorkspaceId::FIRST
+            })
+        );
+        assert_eq!(wm.keyboard_focus(), Some(window));
+        assert_eq!(wm.windows().count(), 1);
+    }
+
+    #[test]
+    fn disconnecting_inactive_monitor_does_not_steal_survivor_focus() {
+        let mut wm = WmState::new();
+        let survivor = wm.add_monitor();
+        let disconnected = wm.add_monitor();
+        let resident = wm
+            .add_window(WindowOwner {
+                monitor: survivor,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let migrant = wm
+            .add_window(WindowOwner {
+                monitor: disconnected,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        wm.evacuate_monitor(
+            disconnected,
+            Some((
+                survivor,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(wm.keyboard_focus(), Some(resident));
+        assert_eq!(wm.owner(migrant).unwrap().monitor, survivor);
+    }
+
+    #[test]
+    fn surviving_monitor_reflows_floating_windows_when_origin_moves() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let window = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor,
+            rect: Rect {
+                x: 4000,
+                y: 70,
+                width: 300,
+                height: 200,
+            },
+        })
+        .unwrap();
+        wm.shift_monitor_floats(
+            monitor,
+            -3840,
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        assert_eq!(
+            wm.floating_rect(window),
+            Some(Rect {
+                x: 160,
+                y: 70,
+                width: 300,
+                height: 200
+            })
+        );
+        wm.shift_monitor_floats(
+            monitor,
+            3840,
+            0,
+            Rect {
+                x: 3840,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        );
+        assert_eq!(wm.floating_rect(window).unwrap().x, 4000);
+    }
+
+    #[test]
+    fn floating_transfer_updates_ownership_and_focus_without_duplicate_windows() {
+        let mut wm = WmState::new();
+        let first = wm.add_monitor();
+        let second = wm.add_monitor();
+        let destination_workspace = WorkspaceId::new(3).unwrap();
+        wm.set_active_workspace(second, destination_workspace);
+        let survivor = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let moving = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let resident = wm
+            .add_window(WindowOwner {
+                monitor: second,
+                workspace: destination_workspace,
+            })
+            .unwrap();
+        let rect = Rect {
+            x: 400,
+            y: 40,
+            width: 300,
+            height: 200,
+        };
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor: first,
+            rect,
+        })
+        .unwrap();
+        let transfer = WmCommand::TransferFloating {
+            window: moving,
+            destination: second,
+            x: 900,
+            y: 60,
+        };
+        assert_eq!(
+            wm.execute(transfer),
+            Ok(CommandEffect::WindowTransferred {
+                from: first,
+                to: second,
+                window: moving
+            })
+        );
+        assert_eq!(
+            wm.owner(moving),
+            Some(WindowOwner {
+                monitor: second,
+                workspace: destination_workspace
+            })
+        );
+        assert_eq!(
+            wm.floating_rect(moving),
+            Some(Rect {
+                x: 900,
+                y: 60,
+                ..rect
+            })
+        );
+        assert_eq!(wm.focused_window(first, WorkspaceId::FIRST), Some(survivor));
+        assert_eq!(wm.keyboard_focus(), Some(moving));
+        assert_eq!(
+            wm.floating_windows(second, destination_workspace),
+            Some(&[moving][..])
+        );
+        assert_eq!(
+            wm.tiled_windows(second, destination_workspace),
+            Some(&[resident][..])
+        );
+        assert_eq!(wm.windows().count(), 3);
+        assert_eq!(
+            wm.execute(WmCommand::TransferFloating {
+                window: moving,
+                destination: first,
+                x: 100,
+                y: 40
+            }),
+            Ok(CommandEffect::WindowTransferred {
+                from: second,
+                to: first,
+                window: moving
+            })
+        );
+        assert_eq!(
+            wm.focused_window(second, destination_workspace),
+            Some(resident)
+        );
+        assert_eq!(wm.keyboard_focus(), Some(moving));
+        assert_eq!(
+            wm.floating_windows(second, destination_workspace),
+            Some(&[][..])
+        );
+        assert_eq!(
+            wm.floating_windows(first, WorkspaceId::FIRST),
+            Some(&[moving][..])
+        );
+    }
+
+    #[test]
+    fn floating_transfer_rejects_invalid_targets_without_mutating_owners() {
+        let mut wm = WmState::new();
+        let first = wm.add_monitor();
+        let second = wm.add_monitor();
+        let window = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let transfer = |destination, x| WmCommand::TransferFloating {
+            window,
+            destination,
+            x,
+            y: 0,
+        };
+        assert_eq!(
+            wm.execute(transfer(second, 0)),
+            Err(CommandError::NotFloating)
+        );
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+        };
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor: first,
+            rect,
+        })
+        .unwrap();
+        assert_eq!(
+            wm.execute(transfer(MonitorId(u64::MAX), 0)),
+            Err(CommandError::UnknownMonitor)
+        );
+        assert_eq!(
+            wm.execute(transfer(second, i32::MAX)),
+            Err(CommandError::InvalidGeometry)
+        );
+        assert_eq!(
+            wm.owner(window),
+            Some(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST
+            })
+        );
+        assert_eq!(wm.floating_rect(window), Some(rect));
+        assert_eq!(
+            wm.floating_windows(second, WorkspaceId::FIRST),
+            Some(&[][..])
+        );
+    }
 
     #[test]
     fn master_ratio_is_workspace_local_and_clamped() {
@@ -815,6 +1467,175 @@ mod tests {
                 direction: Direction::Next
             }),
             Err(CommandError::UnknownMonitor)
+        );
+    }
+
+    #[test]
+    fn tiling_mode_is_workspace_local_and_preserves_order_focus_and_master_ratio() {
+        let mut wm = WmState::new();
+        let first = wm.add_monitor();
+        let second = wm.add_monitor();
+        let other = WorkspaceId::new(2).unwrap();
+        let windows: Vec<_> = (0..3)
+            .map(|_| {
+                wm.add_window(WindowOwner {
+                    monitor: first,
+                    workspace: WorkspaceId::FIRST,
+                })
+                .unwrap()
+            })
+            .collect();
+        wm.add_workspace(first, other);
+        let ratio = WmCommand::AdjustMasterRatio {
+            monitor: first,
+            direction: Direction::Next,
+        };
+        wm.execute(ratio).unwrap();
+        let before = wm.master_ratio(first, WorkspaceId::FIRST).unwrap();
+        let focused = wm.keyboard_focus();
+        let toggle = WmCommand::ToggleTilingMode { monitor: first };
+        assert_eq!(
+            wm.tiling_mode(first, WorkspaceId::FIRST),
+            Some(TilingMode::MasterStack)
+        );
+        assert_eq!(
+            wm.execute(toggle),
+            Ok(CommandEffect::LayoutChanged { monitor: first })
+        );
+        assert_eq!(
+            wm.tiling_mode(first, WorkspaceId::FIRST),
+            Some(TilingMode::SideBySide)
+        );
+        assert_eq!(wm.execute(ratio), Ok(CommandEffect::Unchanged));
+        assert_eq!(wm.master_ratio(first, WorkspaceId::FIRST), Some(before));
+        assert_eq!(
+            wm.tiled_windows(first, WorkspaceId::FIRST),
+            Some(windows.as_slice())
+        );
+        assert_eq!(wm.keyboard_focus(), focused);
+        assert_eq!(
+            wm.tiling_mode(second, WorkspaceId::FIRST),
+            Some(TilingMode::MasterStack)
+        );
+        wm.execute(WmCommand::SwitchWorkspace {
+            monitor: first,
+            workspace: other,
+        })
+        .unwrap();
+        assert_eq!(wm.tiling_mode(first, other), Some(TilingMode::MasterStack));
+        wm.execute(WmCommand::SwitchWorkspace {
+            monitor: first,
+            workspace: WorkspaceId::FIRST,
+        })
+        .unwrap();
+        assert_eq!(
+            wm.tiling_mode(first, WorkspaceId::FIRST),
+            Some(TilingMode::SideBySide)
+        );
+        wm.execute(toggle).unwrap();
+        assert_eq!(
+            wm.tiling_mode(first, WorkspaceId::FIRST),
+            Some(TilingMode::MasterStack)
+        );
+        assert_eq!(wm.master_ratio(first, WorkspaceId::FIRST), Some(before));
+        assert_eq!(
+            wm.execute(WmCommand::ToggleTilingMode {
+                monitor: MonitorId(u64::MAX)
+            }),
+            Err(CommandError::UnknownMonitor)
+        );
+    }
+
+    #[test]
+    fn tiling_mode_toggle_does_not_move_floating_windows() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let window = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        wm.set_focus(monitor, Some(window));
+        let rect = Rect {
+            x: 40,
+            y: 50,
+            width: 300,
+            height: 200,
+        };
+        wm.execute(WmCommand::FloatFocusedAt { monitor, rect })
+            .unwrap();
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        assert_eq!(wm.floating_rect(window), Some(rect));
+        assert_eq!(
+            wm.floating_windows(monitor, WorkspaceId::FIRST),
+            Some(&[window][..])
+        );
+        assert_eq!(wm.tiled_windows(monitor, WorkspaceId::FIRST), Some(&[][..]));
+        assert_eq!(wm.keyboard_focus(), Some(window));
+    }
+
+    #[test]
+    fn resizing_columns_changes_only_adjacent_weights_and_clamps_minimums() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let windows: Vec<_> = (0..3)
+            .map(|_| {
+                wm.add_window(WindowOwner {
+                    monitor,
+                    workspace: WorkspaceId::FIRST,
+                })
+                .unwrap()
+            })
+            .collect();
+        let command = |delta| WmCommand::ResizeColumnPair {
+            monitor,
+            left: windows[0],
+            right: windows[1],
+            left_width: 300,
+            right_width: 300,
+            delta,
+        };
+        assert_eq!(wm.execute(command(100)).unwrap(), CommandEffect::Unchanged);
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        assert_eq!(
+            wm.execute(command(100)),
+            Ok(CommandEffect::LayoutChanged { monitor })
+        );
+        let weights = wm.column_weights(monitor, WorkspaceId::FIRST).unwrap();
+        assert!(weights[0] > 1000 && weights[1] < 1000);
+        assert_eq!(weights[0] + weights[1], 2000);
+        assert_eq!(weights[2], 1000);
+        wm.execute(command(i32::MAX)).unwrap();
+        let weights = wm.column_weights(monitor, WorkspaceId::FIRST).unwrap();
+        assert!(weights[0] < 2000 && weights[1] > 0);
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        assert_eq!(
+            wm.column_weights(monitor, WorkspaceId::FIRST),
+            Some(weights)
+        );
+        assert_eq!(
+            wm.execute(WmCommand::ResizeColumnPair {
+                monitor,
+                left: windows[0],
+                right: windows[2],
+                left_width: 300,
+                right_width: 300,
+                delta: 10,
+            }),
+            Err(CommandError::UnknownWindow)
+        );
+        assert_eq!(
+            wm.execute(WmCommand::ResizeColumnPair {
+                monitor,
+                left: windows[0],
+                right: windows[1],
+                left_width: 0,
+                right_width: 300,
+                delta: 10,
+            }),
+            Err(CommandError::InvalidGeometry)
         );
     }
 

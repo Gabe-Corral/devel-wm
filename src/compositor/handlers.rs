@@ -14,7 +14,7 @@ use smithay::{
         Client, Resource,
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::Serial,
+    utils::{Logical, Point, Rectangle, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -50,6 +50,79 @@ fn same_layer_layout(a: LayerSurfaceCachedState, b: LayerSurfaceCachedState) -> 
         && a.layer == b.layer
         && (a.margin.top, a.margin.right, a.margin.bottom, a.margin.left)
             == (b.margin.top, b.margin.right, b.margin.bottom, b.margin.left)
+}
+
+/// Positioners use parent-window-geometry coordinates, not global coordinates.
+fn popup_constraint_target(
+    output: Rectangle<i32, Logical>,
+    parent_origin: Point<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    Rectangle::new(output.loc - parent_origin, output.size)
+}
+
+impl Compositor {
+    fn popup_constraint(&self, popup: &PopupSurface) -> Option<Rectangle<i32, Logical>> {
+        let parent = popup.get_parent_surface()?;
+        let root = find_popup_root_surface(&PopupKind::Xdg(popup.clone())).ok()?;
+        let (output, root_origin) = if let Some(window) = self.surface_windows.get(&root) {
+            let id = self.window_ids.get(window)?;
+            let scene = self.scene_windows.get(id)?;
+            let output = self
+                .output_monitors
+                .iter()
+                .find(|(_, monitor)| Some(**monitor) == self.wm.owner(*id).map(|o| o.monitor))?
+                .0;
+            (
+                output,
+                self.space.element_location(scene)? + window.geometry().loc,
+            )
+        } else {
+            let entry = self.layers.get(&root)?;
+            let layer_map = layer_map_for_output(&entry.output);
+            let origin = self.space.output_geometry(&entry.output)?.loc
+                + layer_map.layer_geometry(&entry.layer)?.loc
+                - entry.layer.bbox().loc;
+            (&entry.output, origin)
+        };
+        let parent_offset = if parent == root {
+            (0, 0).into()
+        } else {
+            smithay::desktop::PopupManager::popups_for_surface(&root)
+                .find(|(candidate, _)| candidate.wl_surface() == &parent)
+                .map(|(_, location)| location)?
+        };
+        Some(popup_constraint_target(
+            self.space.output_geometry(output)?,
+            root_origin + parent_offset,
+        ))
+    }
+
+    fn position_popup(&self, popup: &PopupSurface, positioner: PositionerState) {
+        let geometry = self
+            .popup_constraint(popup)
+            .map(|target| positioner.get_unconstrained_geometry(target))
+            .unwrap_or_else(|| positioner.get_geometry());
+        popup.with_pending_state(|state| {
+            state.geometry = geometry;
+            state.positioner = positioner;
+        });
+    }
+
+    pub(super) fn refresh_reactive_popups(&self, root: &WlSurface) {
+        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(root) {
+            let PopupKind::Xdg(popup) = popup else {
+                continue;
+            };
+            if !popup.is_initial_configure_sent() {
+                continue;
+            }
+            let positioner = popup.with_pending_state(|state| state.positioner);
+            if positioner.reactive && self.popup_constraint(&popup).is_some() {
+                self.position_popup(&popup, positioner);
+                let _ = popup.send_pending_configure();
+            }
+        }
+    }
 }
 
 impl CompositorHandler for Compositor {
@@ -99,6 +172,13 @@ impl CompositorHandler for Compositor {
             self.refresh_toplevel_decoration(surface);
         }
         self.popups.commit(surface);
+        if let Some(popup) = self.popups.find_popup(surface)
+            && let Ok(root) = find_popup_root_surface(&popup)
+        {
+            // A parent popup may have just acknowledged a new position. Its
+            // reactive children need a target in the updated coordinate space.
+            self.refresh_reactive_popups(&root);
+        }
         if let Some(entry) = self.layers.get_mut(surface) {
             let current = entry.layer.cached_state();
             let changed = !same_layer_layout(entry.layout_state, current);
@@ -114,6 +194,9 @@ impl CompositorHandler for Compositor {
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
         {
+            // A layer parent can acquire its output geometry only at commit.
+            let positioner = popup.with_pending_state(|state| state.positioner);
+            self.position_popup(&popup, positioner);
             let _ = popup.send_configure();
         }
     }
@@ -122,6 +205,26 @@ impl CompositorHandler for Compositor {
 impl BufferHandler for Compositor {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
+
+#[cfg(feature = "native")]
+impl smithay::wayland::dmabuf::DmabufHandler for Compositor {
+    fn dmabuf_state(&mut self) -> &mut smithay::wayland::dmabuf::DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &smithay::wayland::dmabuf::DmabufGlobal,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        // Advertised formats are imported on the single renderer during repaint.
+        let _ = notifier.successful::<Self>();
+    }
+}
+
+#[cfg(feature = "native")]
+smithay::delegate_dmabuf!(Compositor);
 
 impl ShmHandler for Compositor {
     fn shm_state(&self) -> &ShmState {
@@ -144,8 +247,69 @@ impl XdgShellHandler for Compositor {
         self.unregister_toplevel(surface.wl_surface());
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    fn move_request(
+        &mut self,
+        surface: ToplevelSurface,
+        seat_resource: wl_seat::WlSeat,
+        serial: Serial,
+    ) {
+        let Some(seat) = Seat::from_resource(&seat_resource).filter(|seat| seat == &self.seat)
+        else {
+            return;
+        };
+        let Some(pointer) = seat
+            .get_pointer()
+            .filter(|pointer| pointer.has_grab(serial))
+        else {
+            return;
+        };
+        let Some(grab) = pointer.grab_start_data() else {
+            return;
+        };
+        // BTN_LEFT from linux/input-event-codes.h; only that button ends the
+        // floating drag in the shared input path.
+        if grab.button != 0x110 {
+            return;
+        }
+        // An xdg move must originate from a real press on this toplevel,
+        // including its client-side decoration or subsurfaces. Reject stale
+        // serials and presses on a different window or a layer surface.
+        let Some((focus, _)) = grab.focus else { return };
+        let Some(window) = self.surface_windows.get(surface.wl_surface()).cloned() else {
+            return;
+        };
+        let Some((under, origin)) = self.space.element_under(grab.location) else {
+            return;
+        };
+        if under.window != window
+            || under
+                .window
+                .surface_under(
+                    grab.location - origin.to_f64(),
+                    smithay::desktop::WindowSurfaceType::ALL,
+                )
+                .is_none_or(|(pressed, _)| pressed != focus)
+            || !self.begin_client_move_drag(&window, grab.location)
+        {
+            return;
+        }
+        tracing::info!("client xdg move request started floating drag");
+        let time = self.start_time.elapsed().as_millis() as u32;
+        pointer.motion(
+            self,
+            None,
+            &smithay::input::pointer::MotionEvent {
+                location: pointer.current_location(),
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let _ = self.popups.track_popup(PopupKind::Xdg(surface.clone()));
+        self.position_popup(&surface, positioner);
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -158,10 +322,7 @@ impl XdgShellHandler for Compositor {
         positioner: PositionerState,
         token: u32,
     ) {
-        surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
-            state.positioner = positioner;
-        });
+        self.position_popup(&surface, positioner);
         surface.send_repositioned(token);
     }
 
@@ -330,6 +491,7 @@ impl ServerDndGrabHandler for Compositor {}
 impl OutputHandler for Compositor {}
 
 delegate_compositor!(Compositor);
+smithay::delegate_viewporter!(Compositor);
 delegate_shm!(Compositor);
 delegate_xdg_shell!(Compositor);
 delegate_xdg_decoration!(Compositor);
@@ -337,3 +499,48 @@ delegate_layer_shell!(Compositor);
 delegate_seat!(Compositor);
 delegate_data_device!(Compositor);
 delegate_output!(Compositor);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+
+    #[test]
+    fn popup_target_uses_parent_geometry_coordinates() {
+        let output = Rectangle::new((600, 100).into(), (200, 150).into());
+        let root_origin: Point<i32, Logical> = (700, 120).into();
+        assert_eq!(
+            popup_constraint_target(output, root_origin),
+            Rectangle::new((-100, -20).into(), (200, 150).into())
+        );
+        // A nested popup's positioner is relative to the parent popup, not
+        // to the root toplevel or the output.
+        assert_eq!(
+            popup_constraint_target(output, root_origin + Point::from((35, 40))),
+            Rectangle::new((-135, -60).into(), (200, 150).into())
+        );
+    }
+
+    #[test]
+    fn positioner_flips_an_edge_popup_inside_the_output() {
+        let positioner = PositionerState {
+            anchor_rect: Rectangle::new((90, 20).into(), (10, 10).into()),
+            rect_size: (40, 20).into(),
+            anchor_edges: Anchor::BottomRight,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::FlipX,
+            ..PositionerState::default()
+        };
+        let target = popup_constraint_target(
+            Rectangle::new((0, 0).into(), (100, 100).into()),
+            (0, 0).into(),
+        );
+        assert_eq!(positioner.get_geometry().loc, (100, 30).into());
+        assert_eq!(
+            positioner.get_unconstrained_geometry(target).loc,
+            (50, 30).into()
+        );
+    }
+}

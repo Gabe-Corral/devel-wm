@@ -1,9 +1,12 @@
 //! Per-window decoration geometry and render elements, interleaved with the
 //! corresponding client surface in Space so overlapping windows stack correctly.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
-use font8x8::{BASIC_FONTS, UnicodeFonts};
+use ab_glyph::{Font, FontRef, ScaleFont, point};
 use smithay::{
     backend::renderer::{
         ImportAll, ImportMem, Renderer,
@@ -12,6 +15,7 @@ use smithay::{
             memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
             solid::{SolidColorBuffer, SolidColorRenderElement},
             surface::WaylandSurfaceRenderElement,
+            utils::CropRenderElement,
         },
     },
     desktop::{Window, space::SpaceElement},
@@ -32,7 +36,28 @@ pub fn insets(decorated: bool) -> (i32, i32) {
     }
 }
 
-fn paint_title(pixels: &mut [u8], width: i32, title: &str, focused: bool) {
+/// A continuous frame around the titlebar and content. The title's opaque
+/// background covers the full top row, so draw these edges in front of it.
+fn border_rects(width: i32, height: i32) -> [(i32, i32, i32, i32); 4] {
+    [
+        (0, 0, BORDER, height),
+        (width - BORDER, 0, BORDER, height),
+        (BORDER, 0, width - BORDER * 2, BORDER),
+        (BORDER, height - BORDER, width - BORDER * 2, BORDER),
+    ]
+}
+
+fn title_font() -> &'static FontRef<'static> {
+    static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        FontRef::try_from_slice(include_bytes!("../../assets/fonts/DejaVuSans.ttf"))
+            .expect("bundled title font")
+    })
+}
+
+fn paint_title(pixels: &mut [u8], logical_width: i32, title: &str, focused: bool, scale: i32) {
+    let width = logical_width * scale;
+    let height = TITLE_HEIGHT * scale;
     let background = if focused {
         [0x54, 0x40, 0x27, 0xff]
     } else {
@@ -41,20 +66,41 @@ fn paint_title(pixels: &mut [u8], width: i32, title: &str, focused: bool) {
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.copy_from_slice(&background);
     }
-    for (index, ch) in title
-        .chars()
-        .take(((width - 16).max(0) / 8) as usize)
-        .enumerate()
-    {
-        let glyph = BASIC_FONTS.get(ch).unwrap_or(BASIC_FONTS.get('?').unwrap());
-        for (y, row) in glyph.iter().enumerate() {
-            for x in 0..8 {
-                if row & (1 << x) != 0 {
-                    let offset = ((y + 8) * width as usize + 8 + index * 8 + x) * 4;
-                    pixels[offset..offset + 4].copy_from_slice(&[0xf5, 0xf5, 0xf5, 0xff]);
-                }
-            }
+    let font = title_font();
+    let scaled = font.as_scaled(14.0 * scale as f32);
+    let baseline = (height as f32 - (scaled.ascent() - scaled.descent())) / 2.0 + scaled.ascent();
+    let padding = 8.0 * scale as f32;
+    let mut x = padding;
+    let mut previous = None;
+    for ch in title.chars() {
+        let id = font.glyph_id(ch);
+        let id = if id.0 == 0 { font.glyph_id('?') } else { id };
+        let kern = previous.map_or(0.0, |last| scaled.kern(last, id));
+        let next_x = x + kern;
+        let advance = scaled.h_advance(id);
+        if next_x + advance > width as f32 - padding {
+            break;
         }
+        x = next_x;
+        if let Some(glyph) =
+            font.outline_glyph(id.with_scale_and_position(14.0 * scale as f32, point(x, baseline)))
+        {
+            let bounds = glyph.px_bounds();
+            glyph.draw(|dx, dy, coverage| {
+                let px = bounds.min.x as i32 + dx as i32;
+                let py = bounds.min.y as i32 + dy as i32;
+                if px >= padding as i32 && px < width - padding as i32 && py >= 0 && py < height {
+                    let offset = ((py * width + px) * 4) as usize;
+                    for channel in 0..3 {
+                        pixels[offset + channel] = (background[channel] as f32 * (1.0 - coverage)
+                            + 245.0 * coverage)
+                            .round() as u8;
+                    }
+                }
+            });
+        }
+        x += advance;
+        previous = Some(id);
     }
 }
 
@@ -65,8 +111,9 @@ struct Decoration {
     focused: bool,
     width: i32,
     height: i32,
-    title_buffer: MemoryRenderBuffer,
-    borders: [SolidColorBuffer; 3],
+    owner_clip: Option<(Rectangle<i32, Logical>, Point<i32, Logical>)>,
+    title_buffers: HashMap<i32, MemoryRenderBuffer>,
+    borders: [SolidColorBuffer; 4],
 }
 
 impl Decoration {
@@ -78,13 +125,8 @@ impl Decoration {
             focused: false,
             width: 1,
             height: 1,
-            title_buffer: MemoryRenderBuffer::new(
-                Fourcc::Argb8888,
-                (1, TITLE_HEIGHT),
-                1,
-                Transform::Normal,
-                None,
-            ),
+            owner_clip: None,
+            title_buffers: HashMap::new(),
             borders: std::array::from_fn(|_| {
                 SolidColorBuffer::new((1, 1), [0.22, 0.24, 0.28, 1.0])
             }),
@@ -117,31 +159,35 @@ impl Decoration {
         self.width = width;
         self.height = height;
         if enabled {
-            let mut context = self.title_buffer.render();
-            context.resize((width, TITLE_HEIGHT));
-            context
-                .draw(|pixels| {
-                    paint_title(pixels, width, &self.title, focused);
-                    Ok::<_, ()>(vec![Rectangle::from_size((width, TITLE_HEIGHT).into())])
-                })
-                .expect("infallible title draw");
-            context.update_opaque_regions(Some(vec![Rectangle::from_size(
-                (width, TITLE_HEIGHT).into(),
-            )]));
+            self.title_buffers.clear();
             let color = if focused {
                 [0.28, 0.48, 0.78, 1.0]
             } else {
                 [0.22, 0.24, 0.28, 1.0]
             };
-            for (border, size) in self.borders.iter_mut().zip([
-                (BORDER, height - TITLE_HEIGHT),
-                (BORDER, height - TITLE_HEIGHT),
-                (width - BORDER * 2, BORDER),
-            ]) {
-                border.update(size, color);
+            for (border, (_, _, w, h)) in self.borders.iter_mut().zip(border_rects(width, height)) {
+                border.update((w.max(1), h.max(1)), color);
             }
         }
         true
+    }
+
+    fn title_buffer(&mut self, scale: i32) -> &MemoryRenderBuffer {
+        self.title_buffers.entry(scale).or_insert_with(|| {
+            let size = (self.width * scale, TITLE_HEIGHT * scale);
+            let mut buffer =
+                MemoryRenderBuffer::new(Fourcc::Argb8888, size, scale, Transform::Normal, None);
+            let mut context = buffer.render();
+            context
+                .draw(|pixels| {
+                    paint_title(pixels, self.width, &self.title, self.focused, scale);
+                    Ok::<_, ()>(vec![Rectangle::from_size(size.into())])
+                })
+                .expect("infallible title draw");
+            context.update_opaque_regions(Some(vec![Rectangle::from_size(size.into())]));
+            drop(context);
+            buffer
+        })
     }
 }
 
@@ -152,22 +198,76 @@ mod tests {
     #[test]
     fn title_pixels_are_clipped_and_change_with_focus() {
         let mut pixels = vec![0; 23 * TITLE_HEIGHT as usize * 4];
-        paint_title(&mut pixels, 23, "overlong title", false);
+        paint_title(&mut pixels, 23, "overlong title", false, 1);
         assert!(
             pixels
                 .chunks_exact(4)
                 .all(|pixel| pixel == [0x32, 0x30, 0x2d, 0xff])
         );
         let mut pixels = vec![0; 32 * TITLE_HEIGHT as usize * 4];
-        paint_title(&mut pixels, 32, "A never fits", true);
+        paint_title(&mut pixels, 32, "A never fits", true, 1);
         assert_eq!(&pixels[0..4], &[0x54, 0x40, 0x27, 0xff]);
         assert!(
             pixels
                 .chunks_exact(4)
-                .any(|pixel| pixel == [0xf5, 0xf5, 0xf5, 0xff])
+                .any(|pixel| pixel[0] > 0x54 && pixel[3] == 0xff)
         );
         assert_eq!(insets(true), (BORDER, TITLE_HEIGHT));
         assert_eq!(insets(false), (0, 0));
+    }
+
+    #[test]
+    fn title_raster_is_drawn_at_physical_scale_without_resampling() {
+        let mut pixels = vec![0; 64 * (TITLE_HEIGHT * 2) as usize * 4];
+        paint_title(&mut pixels, 32, "A", true, 2);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| { pixel[0] > 0x54 && pixel[0] < 0xf5 && pixel[3] == 0xff })
+        );
+        let mut decoration = Decoration::new();
+        decoration.update(true, "A".into(), true, 32, 48);
+        decoration.title_buffer(2);
+        decoration.title_buffer(1);
+        assert!(decoration.title_buffers.contains_key(&2));
+        assert!(decoration.title_buffers.contains_key(&1));
+        decoration.update(true, "B".into(), true, 32, 48);
+        assert!(decoration.title_buffers.is_empty());
+    }
+
+    #[test]
+    fn border_wraps_title_and_client_without_a_top_gap() {
+        let [left, right, top, bottom] = border_rects(100, 80);
+        assert_eq!(left, (0, 0, BORDER, 80));
+        assert_eq!(right, (100 - BORDER, 0, BORDER, 80));
+        assert_eq!(top, (BORDER, 0, 100 - 2 * BORDER, BORDER));
+        assert_eq!(bottom, (BORDER, 80 - BORDER, 100 - 2 * BORDER, BORDER));
+        // Both sides span the entire titlebar and meet the top/bottom edges.
+        assert!(left.3 > TITLE_HEIGHT);
+        assert_eq!(top.0, left.2);
+        assert_eq!(top.0 + top.2, right.0);
+    }
+
+    #[test]
+    fn owner_clip_stays_on_hdmi_when_client_geometry_spills_onto_dp() {
+        let owner = Rectangle::new((0, 0).into(), (3840, 2160).into());
+        let local = Rectangle::new((-2, -24).into(), (4002, 2100).into());
+        // Window is mapped near HDMI's right edge; render_location on HDMI
+        // includes the client geometry offset, while DP subtracts 3840.
+        let mapped = (3200, 40).into();
+        let scale = Scale::from(1.0);
+        let hdmi = owner_crop_rect(owner, mapped, local, (3202, 64).into(), scale);
+        let dp = owner_crop_rect(owner, mapped, local, (-638, 64).into(), scale);
+        assert_eq!(hdmi.loc, (0, 0).into());
+        assert_eq!(hdmi.size, (3840, 2160).into());
+        assert_eq!(dp.loc, (-3840, 0).into());
+        assert_eq!(dp.size, (3840, 2160).into());
+        let spill = Rectangle::new((0, 40).into(), (900, 2100).into());
+        assert!(!dp.overlaps(spill));
+        let local_clip = local_owner_clip(owner, mapped, local);
+        let oversized_client = Rectangle::new((0, 0).into(), (1200, 2000).into());
+        let visible = oversized_client.intersection(local_clip).unwrap();
+        assert_eq!(visible.loc.x + visible.size.w + 3202, 3840);
     }
 }
 
@@ -207,6 +307,12 @@ impl DecoratedWindow {
 
     pub fn decorated(&self) -> bool {
         self.decoration.lock().unwrap().enabled
+    }
+
+    /// The window belongs to one monitor even if an in-flight client buffer
+    /// temporarily reaches across the boundary while resizing.
+    pub fn set_owner_clip(&self, output: Rectangle<i32, Logical>, mapped_at: Point<i32, Logical>) {
+        self.decoration.lock().unwrap().owner_clip = Some((output, mapped_at));
     }
 
     /// Floating windows live above tiled windows regardless of focus order.
@@ -249,9 +355,17 @@ impl SpaceElement for DecoratedWindow {
     }
 
     fn bbox(&self) -> Rectangle<i32, Logical> {
-        self.window
-            .bbox_with_popups()
-            .merge(SpaceElement::geometry(self))
+        let geometry = SpaceElement::geometry(self);
+        let bbox = self.window.bbox_with_popups().merge(geometry);
+        let Some((output, mapped_at)) = self.decoration.lock().unwrap().owner_clip else {
+            return bbox;
+        };
+        // Space uses bbox for output-enter events and deciding which output
+        // should render an element. Do not advertise an oversized resize
+        // buffer on the adjacent monitor in the first place.
+        let clip = local_owner_clip(output, mapped_at, geometry);
+        bbox.intersection(clip)
+            .unwrap_or_else(|| Rectangle::new(clip.loc, (0, 0).into()))
     }
 
     fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
@@ -286,12 +400,36 @@ smithay::backend::renderer::element::render_elements! {
     Border=SolidColorRenderElement,
 }
 
+fn local_owner_clip(
+    output: Rectangle<i32, Logical>,
+    mapped_at: Point<i32, Logical>,
+    local_geometry: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    Rectangle::new(output.loc - mapped_at + local_geometry.loc, output.size)
+}
+
+fn owner_crop_rect(
+    output: Rectangle<i32, Logical>,
+    mapped_at: Point<i32, Logical>,
+    local_geometry: Rectangle<i32, Logical>,
+    render_location: Point<i32, Physical>,
+    scale: Scale<f64>,
+) -> Rectangle<i32, Physical> {
+    // Smithay passes a per-output render_location: mapped_at minus the
+    // element's local geometry origin and the output's global origin.
+    let clip = local_owner_clip(output, mapped_at, local_geometry);
+    Rectangle::new(
+        render_location + clip.loc.to_physical_precise_round(scale),
+        clip.size.to_physical_precise_round(scale),
+    )
+}
+
 impl<R> AsRenderElements<R> for DecoratedWindow
 where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Send + Clone + 'static,
 {
-    type RenderElement = WindowElements<R>;
+    type RenderElement = CropRenderElement<WindowElements<R>>;
 
     fn render_elements<C: From<Self::RenderElement>>(
         &self,
@@ -302,63 +440,59 @@ where
     ) -> Vec<C> {
         // Client popups must remain in front of the titlebar. The decoration
         // occupies the inset outside the normal toplevel surface.
-        let mut elements: Vec<C> = AsRenderElements::<R>::render_elements::<
+        let mut elements: Vec<WindowElements<R>> = AsRenderElements::<R>::render_elements::<
             WaylandSurfaceRenderElement<R>,
-        >(&self.window, renderer, location, scale, alpha)
+        >(
+            &self.window, renderer, location, scale, alpha
+        )
         .into_iter()
-        .map(|element| WindowElements::Surface(element).into())
+        .map(WindowElements::Surface)
         .collect();
         let geometry = SpaceElement::geometry(self);
-        let deco = self.decoration.lock().unwrap();
+        let mut deco = self.decoration.lock().unwrap();
         if deco.enabled {
             let top = location + geometry.loc.to_physical_precise_round(scale);
+            for ((x, y, w, h), buffer) in border_rects(geometry.size.w, geometry.size.h)
+                .into_iter()
+                .zip(&deco.borders)
+            {
+                if w > 0 && h > 0 {
+                    let offset =
+                        Point::<i32, Logical>::from((x, y)).to_physical_precise_round(scale);
+                    elements.push(WindowElements::Border(
+                        SolidColorRenderElement::from_buffer(
+                            buffer,
+                            top + offset,
+                            scale,
+                            alpha,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
+            }
+            let title_scale = scale.x.round().clamp(1.0, 4.0) as i32;
             let title = MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 top.to_f64(),
-                &deco.title_buffer,
+                deco.title_buffer(title_scale),
                 Some(alpha),
                 None,
                 None,
                 Kind::Unspecified,
             );
             match title {
-                Ok(title) => elements.push(WindowElements::Title(title).into()),
+                Ok(title) => elements.push(WindowElements::Title(title)),
                 Err(error) => tracing::warn!(?error, "failed to upload titlebar"),
             }
-            for ((x, y, w, h), buffer) in [
-                (0, TITLE_HEIGHT, BORDER, geometry.size.h - TITLE_HEIGHT),
-                (
-                    geometry.size.w - BORDER,
-                    TITLE_HEIGHT,
-                    BORDER,
-                    geometry.size.h - TITLE_HEIGHT,
-                ),
-                (
-                    BORDER,
-                    geometry.size.h - BORDER,
-                    geometry.size.w - BORDER * 2,
-                    BORDER,
-                ),
-            ]
-            .into_iter()
-            .zip(&deco.borders)
-            {
-                if w > 0 && h > 0 {
-                    let offset =
-                        Point::<i32, Logical>::from((x, y)).to_physical_precise_round(scale);
-                    elements.push(
-                        WindowElements::Border(SolidColorRenderElement::from_buffer(
-                            buffer,
-                            top + offset,
-                            scale,
-                            alpha,
-                            Kind::Unspecified,
-                        ))
-                        .into(),
-                    );
-                }
-            }
         }
+        let Some((output, mapped_at)) = deco.owner_clip else {
+            return vec![];
+        };
+        let crop = owner_crop_rect(output, mapped_at, geometry, location, scale);
         elements
+            .into_iter()
+            .filter_map(|element| CropRenderElement::from_element(element, scale, crop))
+            .map(Into::into)
+            .collect()
     }
 }

@@ -17,6 +17,11 @@ pub struct PerfStats {
     damaged_pixels: u64,
     output_pixels: u64,
     frames_us: Vec<u64>,
+    input_us: Vec<u64>,
+    flip_us: Vec<u64>,
+    wayland_us: Vec<u64>,
+    resize_updates: u64,
+    resize_configures: u64,
 }
 
 impl Default for PerfStats {
@@ -36,11 +41,36 @@ impl Default for PerfStats {
             damaged_pixels: 0,
             output_pixels: 0,
             frames_us: Vec::new(),
+            input_us: Vec::new(),
+            flip_us: Vec::new(),
+            wayland_us: Vec::new(),
+            resize_updates: 0,
+            resize_configures: 0,
         }
     }
 }
 
 impl PerfStats {
+    pub fn input(&mut self, duration: Duration) {
+        self.input_us.push(micros(duration));
+    }
+
+    pub fn flip(&mut self, duration: Duration) {
+        self.flip_us.push(micros(duration));
+    }
+
+    pub fn wayland(&mut self, duration: Duration) {
+        self.wayland_us.push(micros(duration));
+    }
+
+    pub fn resize_update(&mut self) {
+        self.resize_updates += 1;
+    }
+
+    pub fn resize_configure(&mut self) {
+        self.resize_configures += 1;
+    }
+
     pub fn commit(&mut self, visible: bool) {
         self.commits += 1;
         self.visible_commits += u64::from(visible);
@@ -76,17 +106,15 @@ impl PerfStats {
     }
 
     fn report(&mut self) {
-        if self.events == 0 && self.frames_us.is_empty() {
+        if self.events == 0 && self.frames_us.is_empty() && self.input_us.is_empty() {
             return;
         }
-        self.frames_us.sort_unstable();
-        let p95 = if self.frames_us.is_empty() {
-            0
-        } else {
-            self.frames_us[(self.frames_us.len() * 95 / 100).min(self.frames_us.len() - 1)]
-        };
+        let frame_p95 = p95(&mut self.frames_us);
+        let input_p95 = p95(&mut self.input_us);
+        let flip_p95 = p95(&mut self.flip_us);
+        let wayland_p95 = p95(&mut self.wayland_us);
         eprintln!(
-            "PERF interval_ms={} events={} commits={} visible_commits={} refresh_us={} cleanup_us={} ipc_us={} redraw_requests={} frames={} submitted={} render_us={} submit_us={} frame_p95_us={} damaged_pixels={} output_pixels={}",
+            "PERF interval_ms={} events={} commits={} visible_commits={} refresh_us={} cleanup_us={} ipc_us={} redraw_requests={} frames={} submitted={} render_us={} submit_us={} frame_p95_us={} damaged_pixels={} output_pixels={} input_events={} input_p95_us={} input_max_us={} flips={} flip_p95_us={} flip_max_us={} wayland_dispatches={} wayland_p95_us={} wayland_max_us={} resize_updates={} resize_configures={}",
             self.since.elapsed().as_millis(),
             self.events,
             self.commits,
@@ -99,9 +127,20 @@ impl PerfStats {
             self.submitted,
             self.render_us,
             self.submit_us,
-            p95,
+            frame_p95,
             self.damaged_pixels,
             self.output_pixels,
+            self.input_us.len(),
+            input_p95,
+            self.input_us.last().copied().unwrap_or(0),
+            self.flip_us.len(),
+            flip_p95,
+            self.flip_us.last().copied().unwrap_or(0),
+            self.wayland_us.len(),
+            wayland_p95,
+            self.wayland_us.last().copied().unwrap_or(0),
+            self.resize_updates,
+            self.resize_configures,
         );
         self.since = Instant::now();
         self.events = 0;
@@ -117,6 +156,11 @@ impl PerfStats {
         self.damaged_pixels = 0;
         self.output_pixels = 0;
         self.frames_us.clear();
+        self.input_us.clear();
+        self.flip_us.clear();
+        self.wayland_us.clear();
+        self.resize_updates = 0;
+        self.resize_configures = 0;
     }
 }
 
@@ -128,4 +172,12 @@ impl Drop for PerfStats {
 
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn p95(samples: &mut [u64]) -> u64 {
+    samples.sort_unstable();
+    samples
+        .get((samples.len() * 95 / 100).min(samples.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0)
 }

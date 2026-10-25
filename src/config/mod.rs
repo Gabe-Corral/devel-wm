@@ -1,4 +1,4 @@
-//! Validated, action-oriented TOML keybindings. The WM itself never parses keys.
+//! Validated TOML shortcuts, layout gaps, terminal command and native startup output settings.
 
 use std::{
     collections::HashMap,
@@ -21,6 +21,78 @@ pub enum Action {
     PromoteFocusedToMaster,
     AdjustMasterRatio(Direction),
     ToggleFloating,
+    LaunchTerminal,
+    CloseFocused,
+    ToggleTilingMode,
+}
+
+/// Native output startup request; `None` uses the connector's preferred mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputMode {
+    pub width: u16,
+    pub height: u16,
+    pub refresh_hz: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputConfig {
+    mode: Option<String>,
+    #[serde(default = "default_output_scale")]
+    scale: i32,
+}
+
+fn default_output_scale() -> i32 {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputSettings {
+    pub mode: Option<OutputMode>,
+    pub scale: i32,
+}
+
+impl Default for OutputSettings {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            scale: 1,
+        }
+    }
+}
+
+fn valid_output_name(name: &str) -> bool {
+    name.rsplit_once('-').is_some_and(|(kind, number)| {
+        !kind.is_empty()
+            && kind
+                .bytes()
+                .all(|byte| byte.is_ascii_alphabetic() || byte == b'-')
+            && !kind.starts_with('-')
+            && !kind.ends_with('-')
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn parse_output_mode(text: &str) -> Result<OutputMode, ConfigError> {
+    let error = || {
+        ConfigError(format!(
+            "invalid output mode '{text}'; expected WIDTHxHEIGHT@HZ (for example 1920x1080@144)"
+        ))
+    };
+    let (size, rate) = text.split_once('@').ok_or_else(error)?;
+    let (width, height) = size.split_once('x').ok_or_else(error)?;
+    let width: u16 = width.parse().map_err(|_| error())?;
+    let height: u16 = height.parse().map_err(|_| error())?;
+    let refresh_hz: u32 = rate.parse().map_err(|_| error())?;
+    if width == 0 || height == 0 || refresh_hz == 0 {
+        return Err(error());
+    }
+    Ok(OutputMode {
+        width,
+        height,
+        refresh_hz,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -119,16 +191,67 @@ impl Error for ConfigError {}
 struct FileConfig {
     #[serde(default)]
     keybindings: HashMap<String, String>,
+    #[serde(default)]
+    terminal: TerminalConfig,
+    #[serde(default)]
+    outputs: HashMap<String, OutputConfig>,
+    #[serde(default)]
+    layout: LayoutConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayoutConfig {
+    #[serde(default = "default_gap")]
+    inner_gap: i32,
+    #[serde(default = "default_gap")]
+    outer_gap: i32,
+}
+
+fn default_gap() -> i32 {
+    8
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            inner_gap: default_gap(),
+            outer_gap: default_gap(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalConfig {
+    #[serde(default = "default_terminal_command")]
+    command: Vec<String>,
+}
+
+fn default_terminal_command() -> Vec<String> {
+    vec!["alacritty".into()]
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            command: default_terminal_command(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct Keybindings {
     bindings: HashMap<Chord, Action>,
+    terminal: TerminalConfig,
+    outputs: HashMap<String, OutputSettings>,
+    layout: LayoutConfig,
 }
 
 impl Default for Keybindings {
     fn default() -> Self {
-        Self::from_overrides(HashMap::new()).expect("built-in bindings must be valid")
+        Self::from_overrides(HashMap::new(), TerminalConfig::default())
+            .expect("built-in bindings must be valid")
     }
 }
 
@@ -137,7 +260,38 @@ impl Keybindings {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let file: FileConfig =
             toml::from_str(text).map_err(|e| ConfigError(format!("invalid TOML: {e}")))?;
-        Self::from_overrides(file.keybindings)
+        let mut keys = Self::from_overrides(file.keybindings, file.terminal)?;
+        for (name, value) in [
+            ("inner_gap", file.layout.inner_gap),
+            ("outer_gap", file.layout.outer_gap),
+        ] {
+            if value < 0 {
+                return Err(ConfigError(format!(
+                    "layout.{name} must be nonnegative logical pixels"
+                )));
+            }
+        }
+        keys.layout = file.layout;
+        for (name, config) in file.outputs {
+            if !valid_output_name(&name) {
+                return Err(ConfigError(format!(
+                    "invalid native output name '{name}'; expected a connector name such as HDMI-A-2 or DP-4"
+                )));
+            }
+            if !(1..=4).contains(&config.scale) {
+                return Err(ConfigError(format!(
+                    "output '{name}' scale must be an integer from 1 to 4"
+                )));
+            }
+            keys.outputs.insert(
+                name,
+                OutputSettings {
+                    mode: config.mode.as_deref().map(parse_output_mode).transpose()?,
+                    scale: config.scale,
+                },
+            );
+        }
+        Ok(keys)
     }
 
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
@@ -162,7 +316,30 @@ impl Keybindings {
             .copied()
     }
 
-    fn from_overrides(mut overrides: HashMap<String, String>) -> Result<Self, ConfigError> {
+    pub fn terminal_command(&self) -> (&str, &[String]) {
+        (&self.terminal.command[0], &self.terminal.command[1..])
+    }
+
+    pub fn output_settings(&self, connector: &str) -> OutputSettings {
+        self.outputs.get(connector).copied().unwrap_or_default()
+    }
+
+    pub fn layout_gaps(&self) -> (i32, i32) {
+        (self.layout.inner_gap, self.layout.outer_gap)
+    }
+
+    fn from_overrides(
+        mut overrides: HashMap<String, String>,
+        terminal: TerminalConfig,
+    ) -> Result<Self, ConfigError> {
+        if terminal.command.is_empty()
+            || terminal
+                .command
+                .iter()
+                .any(|part| part.is_empty() || part.contains('\0'))
+        {
+            return Err(ConfigError("terminal.command must be a nonempty array of nonempty program/argument strings without NUL bytes".into()));
+        }
         let mut named = Vec::new();
         for number in 1..=9 {
             let workspace = WorkspaceId::new(number).expect("nonzero workspace");
@@ -190,6 +367,9 @@ impl Keybindings {
                 "Alt+l".to_owned(),
             ),
             (Action::ToggleFloating, "Alt+space".to_owned()),
+            (Action::LaunchTerminal, "Alt+Shift+Return".to_owned()),
+            (Action::CloseFocused, "Alt+Ctrl+q".to_owned()),
+            (Action::ToggleTilingMode, "Alt+t".to_owned()),
         ]);
         let mut bindings = HashMap::new();
         for (action, default) in named {
@@ -217,7 +397,12 @@ impl Keybindings {
                 )));
             }
         }
-        Ok(Self { bindings })
+        Ok(Self {
+            bindings,
+            terminal,
+            outputs: HashMap::new(),
+            layout: LayoutConfig::default(),
+        })
     }
 }
 
@@ -235,6 +420,9 @@ fn action_name(action: Action) -> String {
         Action::AdjustMasterRatio(Direction::Previous) => "shrink-master".into(),
         Action::AdjustMasterRatio(Direction::Next) => "grow-master".into(),
         Action::ToggleFloating => "toggle-floating".into(),
+        Action::LaunchTerminal => "launch-terminal".into(),
+        Action::CloseFocused => "close-focused".into(),
+        Action::ToggleTilingMode => "toggle-tiling-mode".into(),
     }
 }
 
@@ -259,6 +447,50 @@ fn default_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_output_settings_default_and_validate_requests() {
+        let keys = Keybindings::parse(
+            "[outputs.HDMI-A-2]\nmode = '3840x2160@60'\nscale = 2\n\n[outputs.DP-4]\nscale = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            keys.output_settings("HDMI-A-2"),
+            OutputSettings {
+                mode: Some(OutputMode {
+                    width: 3840,
+                    height: 2160,
+                    refresh_hz: 60
+                }),
+                scale: 2,
+            }
+        );
+        assert_eq!(keys.output_settings("DP-4"), OutputSettings::default());
+        assert_eq!(
+            Keybindings::parse("[outputs.HDMI-A-1]\nscale = 2\n")
+                .unwrap()
+                .output_settings("HDMI-A-1")
+                .scale,
+            2
+        );
+        assert_eq!(
+            Keybindings::default().output_settings("HDMI-A-2"),
+            OutputSettings::default()
+        );
+        for invalid in [
+            "[outputs.DP-4]\nscale = 0\n",
+            "[outputs.DP-4]\nscale = 5\n",
+            "[outputs.DP-4]\nscale = 1.5\n",
+            "[outputs.DP-4]\nmode = '0x1080@144'\n",
+            "[outputs.DP-4]\nmode = '1920x1080@0'\n",
+            "[outputs.DP-4]\nmode = '1920x1080@144@60'\n",
+            "[outputs.DP-4]\nunknown = 1\n",
+            "[outputs.'HDMI-A-']\nscale = 2\n",
+            "[outputs.'DP-x']\nscale = 2\n",
+        ] {
+            assert!(Keybindings::parse(invalid).is_err(), "{invalid}");
+        }
+    }
 
     fn mods(shift: bool, logo: bool) -> ModifiersState {
         ModifiersState {
@@ -316,6 +548,63 @@ mod tests {
             keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_l)),
             Some(Action::AdjustMasterRatio(Direction::Next))
         );
+        assert_eq!(
+            keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Return)),
+            Some(Action::LaunchTerminal)
+        );
+        let ctrl_alt = ModifiersState {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys.lookup(&ctrl_alt, Keysym::new(keysyms::KEY_q)),
+            Some(Action::CloseFocused)
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_t)),
+            Some(Action::ToggleTilingMode)
+        );
+        assert_eq!(keys.terminal_command(), ("alacritty", &[][..]));
+    }
+
+    #[test]
+    fn close_focused_binding_can_be_overridden_and_conflicts_are_rejected() {
+        let keys = Keybindings::parse("[keybindings]\nclose-focused = 'Super+q'\n").unwrap();
+        let logo = ModifiersState {
+            logo: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keys.lookup(&logo, Keysym::new(keysyms::KEY_q)),
+            Some(Action::CloseFocused)
+        );
+        assert_eq!(
+            keys.lookup(
+                &ModifiersState {
+                    alt: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+                Keysym::new(keysyms::KEY_q)
+            ),
+            None
+        );
+        assert!(Keybindings::parse("[keybindings]\nclose-focused = 'Alt+j'\n").is_err());
+    }
+
+    #[test]
+    fn tiling_mode_binding_can_be_overridden_and_conflicts_are_rejected() {
+        let keys = Keybindings::parse("[keybindings]\ntoggle-tiling-mode = 'Super+t'\n").unwrap();
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_t)),
+            Some(Action::ToggleTilingMode)
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_t)),
+            None
+        );
+        assert!(Keybindings::parse("[keybindings]\ntoggle-tiling-mode = 'Alt+j'\n").is_err());
     }
 
     #[test]
@@ -348,6 +637,34 @@ mod tests {
             keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_h)),
             None
         );
+    }
+
+    #[test]
+    fn layout_gaps_default_and_override_independently() {
+        assert_eq!(Keybindings::default().layout_gaps(), (8, 8));
+        assert_eq!(Keybindings::parse("").unwrap().layout_gaps(), (8, 8));
+        assert_eq!(
+            Keybindings::parse("[layout]\ninner_gap = 0\nouter_gap = 24\n")
+                .unwrap()
+                .layout_gaps(),
+            (0, 24)
+        );
+        assert_eq!(
+            Keybindings::parse("[layout]\nouter_gap = 0\n")
+                .unwrap()
+                .layout_gaps(),
+            (8, 0)
+        );
+        for text in [
+            "[layout]\ninner_gap = -1\n",
+            "[layout]\nouter_gap = -1\n",
+            "[layout]\ninner_gap = 1.5\n",
+            "[layout]\nouter_gap = '8'\n",
+            "[layout]\ngap = 8\n",
+            "[layout]\nouter_gap = 2147483648\n",
+        ] {
+            assert!(Keybindings::parse(text).is_err(), "accepted: {text}");
+        }
     }
 
     #[test]
@@ -387,5 +704,42 @@ mod tests {
             keys.lookup(&mods(true, true), Keysym::new(keysyms::KEY_h)),
             Some(Action::SwapTile(Direction::Next))
         );
+    }
+
+    #[test]
+    fn terminal_program_arguments_and_shortcut_are_configurable() {
+        let keys = Keybindings::parse(
+            "[terminal]\ncommand = ['foot', '--title', 'my terminal']\n[keybindings]\nlaunch-terminal = 'Super+t'\n",
+        ).unwrap();
+        assert_eq!(
+            keys.terminal_command(),
+            (
+                "foot",
+                &["--title".to_owned(), "my terminal".to_owned()][..]
+            )
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_t)),
+            Some(Action::LaunchTerminal)
+        );
+        assert_eq!(
+            keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Return)),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_terminal_commands_and_shortcut_conflicts_are_rejected() {
+        for text in [
+            "[terminal]\ncommand = []",
+            "[terminal]\ncommand = ['']",
+            "[terminal]\ncommand = ['foot', '']",
+            "[terminal]\ncommand = [\"foo\\u0000bar\"]",
+            "[terminal]\ncommand = 'foot'",
+            "[terminal]\nunknown = 'foot'",
+            "[keybindings]\nlaunch-terminal = 'Alt+Return'",
+        ] {
+            assert!(Keybindings::parse(text).is_err(), "accepted: {text}");
+        }
     }
 }

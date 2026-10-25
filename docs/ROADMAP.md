@@ -44,18 +44,60 @@ Check an item only after its stated behavior is verified. This tracks the standa
 
 ## 4. Native outputs and multi-monitor behavior
 
-- [ ] Start directly from a Linux session using seat/session management, DRM/KMS, GPU-backed rendering, and libinput; keep the nested backend for development.
-- [ ] Give each monitor its own workspaces, active view, focus, output scale, and usable area; test with two physical or virtual outputs.
-- [ ] Handle output hotplug, scaling and mode changes, and real cross-output floating drags to the destination's active workspace without losing or duplicating windows.
-- [ ] On disconnect, transfer windows to a surviving monitor's active workspace, preserve floating state, clamp positions, and recover focus. If all outputs disappear, retain state until one returns.
-- [ ] Check native rendering and input on target hardware and verify the active GPU renderer.
+The historical root hardware logs, including extensionless `2`, were removed
+at the user's request after their results were summarized here and in
+[NATIVE.md](NATIVE.md). Native IPC now feeds a prototype bar via
+`scripts/run-native-with-bar.sh`; its first physical run showed the bar
+configured at 3840×32 and both outputs restored. Interactive bar behavior
+remains to be checked in the unlimited native session. The bounded
+`--native-client` test path has been retired.
+Startup-only validated mode and integer-scale settings exist. HDMI-A-2
+at scale 2 has been visually checked on physical 4K/60 Hz, while selection of a
+different advertised timing remains unverified. Automatic native selection
+on one card passed a bounded HDMI-A-2/DP-4 hardware run with shell exit status
+0 and both outputs restored. A separate bounded run started on HDMI-A-2,
+discovered DP-4 on plug-in, presented both, transferred a floating window in
+both directions and restored both outputs with reported exit status 0.
+The first plug event caused three slow HDMI connector probes (up to 302 ms).
+After removing forced probes of unchanged online outputs, a bounded recheck
+again restored both displays with exit status 0 and no HDMI probe notices,
+but libinput reported 382 ms of processing lag around hotplug. Responsiveness
+still needs investigation. A timed follow-up isolated a 220 ms unforced DP-4
+status query inside a 222 ms udev callback (existing-head checks under 0.02 ms);
+the later forced DP-4 probe took 66 ms in an 83 ms settling pass. No libinput
+warning appeared in that run, which exited with reported status 0, but the
+callback still blocks input. An off-input-loop discovery-query candidate is
+implemented. Its bounded physical check passed with reported exit status 0:
+the first udev callback fell to 0.12 ms, DP-4 presented, and both outputs
+restored. A second udev event still spent 66.7 ms checking HDMI-A-2 while
+the background DP-4 query took 70.5 ms; query contention is plausible but
+unproven. No libinput lag warning appeared. Named
+connectors remain the fallback.
+
+For the current native milestone, output mode and integer scale (1–4) are
+startup-only settings. Live mode/scale switching and fractional scale are
+explicitly deferred; their mention in the broader hotplug item below is not
+a prerequisite for starting Milestone 5. Keep the item open for the remaining
+in-scope hardware checks rather than treating an unimplemented live switch as
+a failed bring-up test.
+
+- [x] Select nested by default or explicitly with `--backend nested`; gate the native device probe behind a Cargo feature.
+- [x] Add an opt-in, one-shot libseat/udev DRM card and connector discovery probe (no modeset, rendering, input, or Wayland clients); the user verified card discovery and connected HDMI-A-2 from a separate VT.
+- [x] Add explicit bounded single-output DRM/GBM/EGL/GLES presentation with native renderer logging and page-flip completion; the user verified HDMI-A-2 on NVIDIA RTX 5070 at 3840×2160/60 Hz and recovery to i3, but a logged restoration error requires cleanup retesting (see [NATIVE.md](NATIVE.md)).
+- [x] Verify scoped atomic restoration on normal exit, early SIGINT, and VT switching for the bounded presentation probe; retain nonzero exit status for cleanup failures. Normal and timed-SIGINT restoration passed on HDMI-A-2, and a controlled libseat switch from tty3 to tty7 logged paused-session cleanup without a restore modeset. The separate bounded interactive client switch and one VT-resume round trip also passed later.
+- [ ] Start directly from a Linux session using seat/session management, DRM/KMS, GPU-backed rendering, and libinput; keep the nested backend for development. The explicit 30-second one-client path displayed Alacritty on HDMI-A-2 with substantially improved resize performance after motion coalescing; controlled libseat VT-switch exit stopped the client and skipped inactive DRM restoration. One bounded single-output VT-resume round trip passed with input and both i3 monitors working afterward. The first opt-in long-running single-output run lasted about 49 seconds, connected multiple clients, handled WM shortcuts and logged successful display/console restore on deliberate exit; the user reported it looked good, though exit status was not captured. The two-output path logged frames and scoped restores on both HDMI-A-2 and DP-4; unplug/replug worked and the user reported no pointer freezes after switching to udev-triggered probes. Longer-term stability remains unverified. Nested remains the default.
+- [ ] Give each monitor its own workspaces, active view, focus, output scale, and usable area; test with two physical or virtual outputs. The pure WM tests independent workspaces/focus with two simulated monitors. Bounded and long-running HDMI-A-2/DP-4 runs logged frames and both scoped restores. The user confirmed cursor crossing, DP-4 workspace switching and a cross-monitor floating drag in the top-aligned default layout `(0, 0)` / `(3840, 0)`. Owner-output clipping removed the earlier Firefox flash during `alt+l` layout resizing. Scale-2 HDMI-A-2 runs confirmed physical 4K mode, 1920-wide logical layout, both frames and restores, but the user reported blurry titles, early cursor crossing, and tiled Firefox clipped at HDMI's edge. A scale-aware title bitmap attempt did not fix the blur and was removed. An attempted pointer-speed adjustment also failed; the actual native cursor drawing position was found to use logical coordinates where physical coordinates were required. That conversion is unit-tested and the user confirmed the cursor is fixed in a later bounded run with reported exit status 0 and both output/VT restores. Firefox clipping and blurry titles persisted in those earlier runs. A newer DEBUG capture overwrote `native-scale-2-geo.log`: the right-hand window's committed xdg geometry has a +13 logical x offset, but Smithay's Space compensates for that offset automatically. A later preserved diagnostic log shows a 755×1060 logical xdg geometry with a 1523×2131 logical surface bbox; rendering that surface at HDMI scale 2 creates a 3020×4240 physical element, much of which is correctly cropped at the output edge. The log cannot establish whether the client omitted buffer scale or viewport state. A subsequent bounded log shows Firefox at a 781×1086 logical surface bbox (including margins), with `buffer_scale=2`, `viewport_dst=None`; the user confirmed it is fully visible. This does not prove Firefox used the newly advertised viewporter, so the cause of the changed buffer scale remains uncertain. The temporary geometry/crop diagnostics were removed after that confirmation; standard `wp_viewporter` support remains. The user later confirmed that anti-aliased DejaVu Sans title text looks good at scale 2 in `native-font.log`; both outputs presented and restored, and the VT console restored after deliberate exit. That log does not contain the shell status or separately prove DP-4 title sharpness. The first problematic run logged GLES errors and reported shell status 127; the next reported status 0 and no GLES errors despite the same visual problems. Non-default timing selection, independent terminal placement/focus and longer-term behavior remain open.
+- [ ] Handle output hotplug, scaling and mode changes, and real cross-output floating drags to the destination's active workspace without losing or duplicating windows. Cross-monitor drag is user-verified; Firefox's own xdg titlebar gesture is not separately confirmed. DP-4 unplug/replug, window migration and scoped restoration were user-confirmed again after replacing always-on synchronous connector polling with udev notifications and offline-only retries. The user reports the prior intermittent pointer freezes are fixed; two slow-probe notices (HDMI-A-2 and DP-4) were seen in the terminal but absent from the last saved `2` before log cleanup. A bounded automatic run now confirms new DP-4 discovery, frame presentation, two-way floating transfer and both restores; it also logs three HDMI connector probes blocking input for 143–302 ms on the plug event and a nonfatal Smithay mode-blob warning. Live scale/connected-mode changes remain deferred; startup scale 2 passed visual checks, while a non-preferred advertised timing has not yet been tested on hardware. The earlier roughly 85-second run was not a bounded test; shell exit status was not captured.
+- [ ] On disconnect, transfer windows to a surviving monitor's active workspace, preserve floating state, clamp positions, and recover focus. If all outputs disappear, retain state until one returns. Pure WM and simulated output tests pass; the user confirmed DP-4 disconnect/reconnect and post-replug pointer responsiveness with udev-triggered probes. Both-output loss remains untested on hardware.
+- [x] Check native rendering and input on target hardware and verify the active GPU renderer. Bounded HDMI-A-2/DP-4 runs rendered clients, handled keyboard and pointer input, and logged the NVIDIA GeForce RTX 5070 GLES renderer; this does not establish sustained session stability.
 - [ ] Measure idle repaint activity and frame timing during representative terminal/browser and multi-monitor use; address observed regressions before considering optional rendering features.
 
 ## 5. MVP desktop usability
 
 - [ ] Support per-output layer-shell bars and reserve their exclusive zones; verify separate bar instances can show each monitor's own IPC state.
 - [x] Render a default cursor and client-provided cursor surfaces with hotspot in the nested output; verify the custom cursor from `bar-test` appears and restores on pointer leave.
-- [ ] Provide the remaining essential client behavior: popups/grabs, clipboard/data-device, and any other protocols needed by the MVP test applications. The client-owned clipboard and explicit xdg popup grabs are wired up; verify the [clipboard](CLIPBOARD.md) and [popup](POPUPS.md) smoke tests before marking this complete. Verify cursor behavior on the native backend separately.
+- [x] Verify nested-backend xdg popup creation and edge positioning with Firefox, plus explicit/nested grabs, tokened repositioning, and child-before-parent dismissal with the [popup test client](../popup-test/README.md). Native and multi-output behavior remain unverified.
+- [ ] Provide the remaining essential client behavior: popups/grabs, clipboard/data-device, and any other protocols needed by the MVP test applications. The client-owned clipboard and nested-backend xdg popups are wired up; finish the [clipboard](CLIPBOARD.md) and [popup](POPUPS.md) workflows and verify behavior on the native backend before marking this broader item complete.
 - [ ] Provide a working session-lock and unlock path for a native daily-driver session.
 - [ ] Complete a manual workflow test: launch terminal and browser, type and point, switch per-monitor workspaces, tile and float, drag between monitors, copy/paste, lock/unlock, unplug/replug an output, and exit cleanly.
 - [ ] Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked`; keep pure WM/layout tests and real-client smoke tests meaningful.

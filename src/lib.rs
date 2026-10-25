@@ -5,6 +5,8 @@ pub mod config;
 pub mod input;
 pub mod ipc;
 pub mod layout;
+#[cfg(feature = "native")]
+pub mod native;
 pub mod perf;
 pub mod render;
 pub mod wm;
@@ -17,5 +19,7 @@ pub struct LoopData {
     pub compositor: Compositor,
     pub display_handle: DisplayHandle,
     pub nested: Option<compositor::NestedOutput>,
+    #[cfg(feature = "native")]
+    pub native: Option<native::NativeOutput>,
     pub ipc: Option<ipc::IpcServer>,
 }
