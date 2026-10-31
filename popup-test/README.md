@@ -2,7 +2,7 @@
 
 Standalone native Wayland client for exercising devel-wm's explicit
 `xdg_popup.grab`, nested popup, and `xdg_popup.reposition` handling. It uses
-Smithay Client Toolkit 0.19.2 (matching the separate `bar-test` client); it is
+Smithay Client Toolkit 0.19.2 (matching the separate `devel-bar` client); it is
 not part of the compositor or the root Cargo package.
 
 Start devel-wm in the X11 session with `cargo run --locked`, copy the

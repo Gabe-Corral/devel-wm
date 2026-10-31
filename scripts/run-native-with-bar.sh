@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
-# Auto-discover native outputs and run one prototype bar from a Linux text VT.
+# Auto-discover native outputs and run devel-bar from a Linux text VT.
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 usage() {
     cat <<'EOF'
-Usage: scripts/run-native-with-bar.sh [--config PATH]
+Usage: scripts/run-native-with-bar.sh [--config PATH] [--release] [--perf-sample]
 
 From a separate Linux text VT, discover connected outputs on one DRM card and
-launch them with one prototype bar. --backend native alone is still probe-only.
+launch them with devel-bar. --backend native alone is still probe-only.
 Running this script explicitly opts into an unlimited native session.
+--release builds and runs an optimized devel-wm (bar/menu remain debug builds).
+--perf-sample records devel-wm CPU ticks and RSS once per second.
 Ctrl-C requests the compositor's graceful shutdown; never use kill -9.
 EOF
 }
 
 config=()
+compositor_profile=debug
+compositor_build_flags=()
+perf_sample=false
 while (($#)); do
     case $1 in
+        --perf-sample)
+            perf_sample=true
+            shift
+            ;;
+        --release)
+            compositor_profile=release
+            compositor_build_flags=(--release)
+            shift
+            ;;
         --config)
             if (($# < 2)) || [[ -z $2 ]]; then
                 echo '--config requires a TOML file path' >&2
@@ -41,16 +55,41 @@ if [[ ! -t 0 || ! $tty_path =~ ^/dev/tty([1-9]|[1-5][0-9]|6[0-3])$ ]]; then
 fi
 # Build before acquiring DRM master. The compositor itself refuses native mode
 # outside a Linux text VT as a second safety check.
-cargo build --locked --features native --manifest-path "$root/Cargo.toml"
-cargo build --locked --manifest-path "$root/bar-test/Cargo.toml"
+cargo build --locked --features native "${compositor_build_flags[@]}" --manifest-path "$root/Cargo.toml"
+cargo build --locked --manifest-path "$root/../devel-bar/Cargo.toml"
+cargo build --locked --manifest-path "$root/../devel-menu/Cargo.toml"
 
 log=$(mktemp "$XDG_RUNTIME_DIR/devel-wm-native-launch.XXXXXX")
 compositor_pid=
 bar_pid=
+sampler_pid=
+sample_log=
 compositor_reaped=false
+
+sample_process() {
+    local pid=$1 stat rss peak
+    local -a fields
+    while [[ -r /proc/$pid/stat && -r /proc/$pid/status ]]; do
+        stat=$(</proc/"$pid"/stat) || break
+        read -r -a fields <<< "${stat##*) }"
+        read -r rss peak < <(awk '
+            /^VmRSS:/ {rss=$2}
+            /^VmHWM:/ {peak=$2}
+            END {if (rss != "" && peak != "") print rss, peak}
+        ' "/proc/$pid/status") || break
+        [[ -n $rss && -n $peak ]] || break
+        printf 'PERF_PROCESS pid=%s cpu_ticks=%s rss_kib=%s peak_rss_kib=%s\n' \
+            "$pid" "$((fields[11] + fields[12]))" "$rss" "$peak" >> "$sample_log"
+        sleep 1
+    done
+}
 
 cleanup() {
     trap - EXIT INT TERM
+    if [[ -n $sampler_pid ]]; then
+        kill -TERM "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+    fi
     if [[ -n $bar_pid ]]; then
         kill -TERM "$bar_pid" 2>/dev/null || true
         wait "$bar_pid" 2>/dev/null || true
@@ -70,7 +109,8 @@ trap 'exit 143' TERM
 # Keep a duplicate of the already-open login VT: reopening /dev/ttyN can fail
 # even when the shell has permission to use its existing descriptor.
 exec {vt_fd}<&0
-"$root/target/debug/devel-wm" --backend native --native-session "${config[@]}" \
+DEVEL_MENU_BIN="$root/../devel-menu/target/debug/devel-menu" \
+    "$root/target/$compositor_profile/devel-wm" --backend native --native-session "${config[@]}" \
     <&"$vt_fd" > >(tee "$log") 2>&1 &
 compositor_pid=$!
 exec {vt_fd}<&-
@@ -107,9 +147,17 @@ if [[ ! $wayland_display =~ ^wayland-[0-9]+$ \
 fi
 
 env -u DISPLAY -u WAYLAND_SOCKET WAYLAND_DISPLAY="$wayland_display" \
-    DEVEL_WM_IPC="$ipc_socket" "$root/bar-test/target/debug/prototype-bar" &
+    DEVEL_WM_IPC="$ipc_socket" "$root/../devel-bar/target/debug/devel-bar" &
 bar_pid=$!
-echo "Prototype bar started on $wayland_display (IPC: $ipc_socket)"
+echo "devel-bar started on $wayland_display (one surface per named output; IPC: $ipc_socket)"
+if [[ $perf_sample == true ]]; then
+    # Keep sampling output separate: concurrent writes to the compositor's
+    # stdout/stderr can interleave in the caller's redirected session log.
+    sample_log=$(mktemp "$XDG_RUNTIME_DIR/devel-wm-native-perf.$compositor_pid.XXXXXX")
+    echo "PERF_PROCESS_LOG=$sample_log"
+    sample_process "$compositor_pid" &
+    sampler_pid=$!
+fi
 echo 'Use Ctrl+Alt+Backspace to exit devel-wm; Ctrl-C here also requests graceful exit.'
 
 finished=
@@ -122,9 +170,9 @@ if [[ $finished == "$bar_pid" ]]; then
         sleep 0.1
     done
     if grep -q '^Native session stopping;' "$log"; then
-        echo 'Prototype bar disconnected during native shutdown'
+        echo 'devel-bar disconnected during native shutdown'
     else
-        echo 'Prototype bar exited before devel-wm began shutdown; requesting native cleanup' >&2
+        echo 'devel-bar exited before devel-wm began shutdown; requesting native cleanup' >&2
         kill -INT "$compositor_pid" 2>/dev/null || true
         wait "$compositor_pid" 2>/dev/null || true
         compositor_reaped=true

@@ -1,2 +1,4 @@
 /target/
 /bar-test/target/
+/.opencode/
+*.log

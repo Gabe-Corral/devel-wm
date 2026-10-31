@@ -92,6 +92,30 @@ pub enum WmCommand {
         monitor: MonitorId,
         direction: Direction,
     },
+    InsertTile {
+        monitor: MonitorId,
+        window: WindowId,
+        target: WindowId,
+        after: bool,
+    },
+    GroupTile {
+        monitor: MonitorId,
+        window: WindowId,
+        target: WindowId,
+    },
+    GroupFocusedWithNext {
+        monitor: MonitorId,
+    },
+    DetachFocusedTab {
+        monitor: MonitorId,
+    },
+    CycleGroupTab {
+        monitor: MonitorId,
+    },
+    ActivateGroupTab {
+        monitor: MonitorId,
+        window: WindowId,
+    },
     PromoteFocusedToMaster {
         monitor: MonitorId,
     },
@@ -189,6 +213,12 @@ struct WorkspaceState {
     master_ratio: MasterRatio,
     tiling_mode: TilingMode,
     column_weights: BTreeMap<WindowId, u32>,
+    groups: BTreeMap<WindowId, WindowGroup>,
+}
+
+struct WindowGroup {
+    tabs: Vec<WindowId>,
+    active: WindowId,
 }
 
 impl Default for WorkspaceState {
@@ -200,12 +230,95 @@ impl Default for WorkspaceState {
             master_ratio: MasterRatio::new(600).expect("valid default ratio"),
             tiling_mode: TilingMode::default(),
             column_weights: BTreeMap::new(),
+            groups: BTreeMap::new(),
         }
     }
 }
 
 impl WorkspaceState {
+    fn tile_root(&self, window: WindowId) -> Option<WindowId> {
+        self.tiled.iter().copied().find(|root| {
+            *root == window
+                || self
+                    .groups
+                    .get(root)
+                    .is_some_and(|group| group.tabs.contains(&window))
+        })
+    }
+
+    fn selected(&self, root: WindowId) -> WindowId {
+        self.groups.get(&root).map_or(root, |group| group.active)
+    }
+
+    fn group_tile(&mut self, window: WindowId, target: WindowId) -> Result<bool, CommandError> {
+        let source = self.tile_root(window).ok_or(CommandError::UnknownWindow)?;
+        let target_root = self.tile_root(target).ok_or(CommandError::UnknownWindow)?;
+        if source == target_root {
+            return Ok(false);
+        }
+        self.detach_tab(window).expect("known source tile");
+        let root = self.tile_root(target).expect("target tile remains");
+        let group = self.groups.entry(root).or_insert_with(|| WindowGroup {
+            tabs: vec![root],
+            active: root,
+        });
+        group.tabs.push(window);
+        group.active = window;
+        self.focused_window = Some(window);
+        Ok(true)
+    }
+
+    /// Remove a tab without removing its layout slot unless it was the last tab.
+    fn detach_tab(&mut self, window: WindowId) -> Option<usize> {
+        let root = self.tile_root(window)?;
+        let slot = self.tiled.iter().position(|&id| id == root)?;
+        if let Some(mut group) = self.groups.remove(&root) {
+            let index = group.tabs.iter().position(|&id| id == window)?;
+            group.tabs.remove(index);
+            if group.active == window {
+                group.active = group.tabs[index.min(group.tabs.len() - 1)];
+            }
+            if group.tabs.len() > 1 {
+                let next_root = group.tabs[0];
+                self.tiled[slot] = next_root;
+                if next_root != root
+                    && let Some(weight) = self.column_weights.remove(&root)
+                {
+                    self.column_weights.insert(next_root, weight);
+                }
+                self.groups.insert(next_root, group);
+            } else {
+                let remaining = group.tabs[0];
+                self.tiled[slot] = remaining;
+                if remaining != root
+                    && let Some(weight) = self.column_weights.remove(&root)
+                {
+                    self.column_weights.insert(remaining, weight);
+                }
+            }
+            if self.focused_window == Some(window) {
+                self.focused_window = Some(self.selected(self.tiled[slot]));
+            }
+        } else {
+            self.tiled.remove(slot);
+            self.column_weights.remove(&root);
+            if self.focused_window == Some(window) {
+                self.focused_window = self
+                    .tiled
+                    .get(slot)
+                    .or_else(|| self.tiled.last())
+                    .map(|&id| self.selected(id))
+                    .or_else(|| self.floating.last().copied());
+            }
+        }
+        Some(slot)
+    }
+
     fn remove_window(&mut self, window: WindowId, floating: bool) {
+        if !floating {
+            self.detach_tab(window).expect("registered tile");
+            return;
+        }
         let (order, other) = if floating {
             (&mut self.floating, &self.tiled)
         } else {
@@ -218,7 +331,8 @@ impl WorkspaceState {
         order.remove(index);
         self.column_weights.remove(&window);
         if self.focused_window == Some(window) {
-            self.focused_window = successor(order, index).or_else(|| other.last().copied());
+            self.focused_window = successor(order, index)
+                .or_else(|| other.last().copied().map(|root| self.selected(root)));
         }
     }
 }
@@ -356,6 +470,41 @@ impl WmState {
         )
     }
 
+    pub fn tile_root(&self, window: WindowId) -> Option<WindowId> {
+        let owner = self.owner(window)?;
+        self.monitors
+            .get(&owner.monitor)?
+            .workspaces
+            .get(&owner.workspace)?
+            .tile_root(window)
+    }
+
+    pub fn group_tabs(&self, window: WindowId) -> Option<Vec<WindowId>> {
+        let root = self.tile_root(window)?;
+        let owner = self.owner(window)?;
+        let state = self
+            .monitors
+            .get(&owner.monitor)?
+            .workspaces
+            .get(&owner.workspace)?;
+        Some(
+            state
+                .groups
+                .get(&root)
+                .map_or_else(|| vec![root], |group| group.tabs.clone()),
+        )
+    }
+
+    pub fn selected_tile(&self, root: WindowId) -> Option<WindowId> {
+        let owner = self.owner(root)?;
+        let state = self
+            .monitors
+            .get(&owner.monitor)?
+            .workspaces
+            .get(&owner.workspace)?;
+        state.tiled.contains(&root).then(|| state.selected(root))
+    }
+
     /// Select an existing monitor as the keyboard-focus source.
     pub fn set_active_monitor(&mut self, monitor: MonitorId) -> bool {
         if !self.monitors.contains_key(&monitor) {
@@ -387,9 +536,20 @@ impl WmState {
             return Err(CommandError::UnknownMonitor);
         }
         let workspace = self.active_workspace(target).expect("validated monitor");
+        let target_focus = self.focused_window(target, workspace);
         let focused = self
             .active_workspace(source)
             .and_then(|ws| self.focused_window(source, ws));
+        let groups: Vec<_> = self.monitors[&source]
+            .workspaces
+            .values()
+            .flat_map(|workspace| {
+                workspace
+                    .groups
+                    .values()
+                    .map(|group| (group.tabs.clone(), group.active))
+            })
+            .collect();
         let moving: Vec<_> = self
             .windows
             .iter()
@@ -431,6 +591,23 @@ impl WmState {
             } else {
                 dest.tiled.push(id);
             }
+        }
+        {
+            let dest = self
+                .monitors
+                .get_mut(&target)
+                .expect("target monitor")
+                .workspaces
+                .get_mut(&workspace)
+                .expect("target workspace");
+            for (tabs, selected) in groups {
+                let root = tabs[0];
+                for &tab in &tabs[1..] {
+                    dest.group_tile(tab, root).expect("migrated group members");
+                }
+                dest.groups.get_mut(&root).expect("recreated group").active = selected;
+            }
+            dest.focused_window = target_focus;
         }
         if let Some(focused) = focused.filter(|_| self.active_monitor == Some(source)) {
             self.monitors
@@ -500,6 +677,127 @@ impl WmState {
 
     pub fn execute(&mut self, command: WmCommand) -> Result<CommandEffect, CommandError> {
         match command {
+            WmCommand::GroupTile {
+                monitor,
+                window,
+                target,
+            } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                if active.group_tile(window, target)? {
+                    self.active_monitor = Some(monitor);
+                    Ok(CommandEffect::TileOrderChanged { monitor })
+                } else {
+                    Ok(CommandEffect::Unchanged)
+                }
+            }
+            WmCommand::GroupFocusedWithNext { monitor } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                let window = active.focused_window.ok_or(CommandError::NoFocusedWindow)?;
+                let root = match active.tile_root(window) {
+                    Some(root) => root,
+                    None => return Ok(CommandEffect::Unchanged),
+                };
+                if active.tiled.len() < 2 {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let slot = active
+                    .tiled
+                    .iter()
+                    .position(|&id| id == root)
+                    .expect("known root");
+                let target = active.tiled[(slot + 1) % active.tiled.len()];
+                if active.group_tile(window, target)? {
+                    Ok(CommandEffect::TileOrderChanged { monitor })
+                } else {
+                    Ok(CommandEffect::Unchanged)
+                }
+            }
+            WmCommand::DetachFocusedTab { monitor } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                let window = active.focused_window.ok_or(CommandError::NoFocusedWindow)?;
+                let root = match active.tile_root(window) {
+                    Some(root) => root,
+                    None => return Ok(CommandEffect::Unchanged),
+                };
+                if !active.groups.contains_key(&root) {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let slot = active.detach_tab(window).expect("known tab");
+                active.tiled.insert(slot + 1, window);
+                active.focused_window = Some(window);
+                Ok(CommandEffect::TileOrderChanged { monitor })
+            }
+            WmCommand::CycleGroupTab { monitor } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                let Some(focused) = active.focused_window else {
+                    return Ok(CommandEffect::Unchanged);
+                };
+                let root = match active.tile_root(focused) {
+                    Some(root) => root,
+                    None => return Ok(CommandEffect::Unchanged),
+                };
+                let Some(group) = active.groups.get_mut(&root) else {
+                    return Ok(CommandEffect::Unchanged);
+                };
+                let index = group
+                    .tabs
+                    .iter()
+                    .position(|&id| id == group.active)
+                    .expect("selected tab");
+                group.active = group.tabs[(index + 1) % group.tabs.len()];
+                active.focused_window = Some(group.active);
+                Ok(CommandEffect::FocusChanged { monitor })
+            }
+            WmCommand::ActivateGroupTab { monitor, window } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                let root = active
+                    .tile_root(window)
+                    .ok_or(CommandError::UnknownWindow)?;
+                if let Some(group) = active.groups.get_mut(&root) {
+                    group.active = window;
+                }
+                if active.focused_window == Some(window) && self.active_monitor == Some(monitor) {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                active.focused_window = Some(window);
+                self.active_monitor = Some(monitor);
+                Ok(CommandEffect::FocusChanged { monitor })
+            }
             WmCommand::ToggleTilingMode { monitor } => {
                 let state = self
                     .monitors
@@ -613,6 +911,7 @@ impl WmState {
                     return Ok(CommandEffect::Unchanged);
                 }
                 let index = active.focused_window.and_then(|id| {
+                    let id = active.tile_root(id).unwrap_or(id);
                     active
                         .tiled
                         .iter()
@@ -637,6 +936,9 @@ impl WmState {
                     .or_else(|| active.floating.get(next - active.tiled.len()))
                     .copied()
                     .expect("nonempty order");
+                let window = active
+                    .tile_root(window)
+                    .map_or(window, |root| active.selected(root));
                 if active.focused_window == Some(window) && self.active_monitor == Some(monitor) {
                     return Ok(CommandEffect::Unchanged);
                 }
@@ -654,7 +956,10 @@ impl WmState {
                     .get_mut(&state.active_workspace)
                     .expect("active workspace");
                 let window = active.focused_window.ok_or(CommandError::NoFocusedWindow)?;
-                let index = active.tiled.iter().position(|&id| id == window);
+                let index = active
+                    .tiled
+                    .iter()
+                    .position(|&id| id == active.tile_root(window).unwrap_or(window));
                 let Some(index) = index else {
                     return Ok(CommandEffect::Unchanged);
                 };
@@ -668,6 +973,79 @@ impl WmState {
                 active.tiled.swap(index, neighbor);
                 Ok(CommandEffect::TileOrderChanged { monitor })
             }
+            WmCommand::InsertTile {
+                monitor,
+                window,
+                target,
+                after,
+            } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                let source_root = active
+                    .tile_root(window)
+                    .ok_or(CommandError::UnknownWindow)?;
+                let target = active
+                    .tile_root(target)
+                    .ok_or(CommandError::UnknownWindow)?;
+                // A tab dropped onto its own group's content becomes a new
+                // adjacent tile. Remember a sibling: detaching the root tab
+                // can change the group's root identity.
+                let target_tab = if source_root == target {
+                    active
+                        .groups
+                        .get(&target)
+                        .and_then(|group| group.tabs.iter().copied().find(|&tab| tab != window))
+                } else {
+                    Some(target)
+                };
+                let source = active
+                    .tiled
+                    .iter()
+                    .position(|&id| id == source_root)
+                    .ok_or(CommandError::UnknownWindow)?;
+                let destination = active
+                    .tiled
+                    .iter()
+                    .position(|&id| id == target)
+                    .ok_or(CommandError::UnknownWindow)?;
+                if source == destination && target_tab.is_none() {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let insertion = destination + usize::from(after);
+                if source_root == window
+                    && !active.groups.contains_key(&source_root)
+                    && source == insertion - usize::from(source < insertion)
+                {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let weight = (source_root == window && !active.groups.contains_key(&source_root))
+                    .then(|| active.column_weights.get(&window).copied())
+                    .flatten();
+                active.detach_tab(window).expect("known source tab");
+                let destination = active
+                    .tiled
+                    .iter()
+                    .position(|&id| {
+                        id == active
+                            .tile_root(target_tab.expect("sibling remains"))
+                            .expect("target remains")
+                    })
+                    .expect("target tile remains");
+                active
+                    .tiled
+                    .insert(destination + usize::from(after), window);
+                if let Some(weight) = weight {
+                    active.column_weights.insert(window, weight);
+                }
+                active.focused_window = Some(window);
+                Ok(CommandEffect::TileOrderChanged { monitor })
+            }
             WmCommand::PromoteFocusedToMaster { monitor } => {
                 let state = self
                     .monitors
@@ -678,15 +1056,18 @@ impl WmState {
                     .get_mut(&state.active_workspace)
                     .expect("active workspace");
                 let window = active.focused_window.ok_or(CommandError::NoFocusedWindow)?;
-                let index = active.tiled.iter().position(|&id| id == window);
+                let index = active
+                    .tiled
+                    .iter()
+                    .position(|&id| id == active.tile_root(window).unwrap_or(window));
                 let Some(index) = index else {
                     return Ok(CommandEffect::Unchanged);
                 };
                 if index == 0 {
                     return Ok(CommandEffect::Unchanged);
                 }
-                active.tiled.remove(index);
-                active.tiled.insert(0, window);
+                let root = active.tiled.remove(index);
+                active.tiled.insert(0, root);
                 Ok(CommandEffect::TileOrderChanged { monitor })
             }
             WmCommand::AdjustMasterRatio { monitor, direction } => {
@@ -739,8 +1120,11 @@ impl WmState {
                     if !valid_floating_rect(rect) {
                         return Err(CommandError::InvalidGeometry);
                     }
-                    active.tiled.retain(|&id| id != window);
+                    active
+                        .detach_tab(window)
+                        .ok_or(CommandError::UnknownWindow)?;
                     active.floating.push(window);
+                    active.focused_window = Some(window);
                     self.saved_floating_rects.remove(&window);
                     self.floating_rects.insert(window, rect);
                 }
@@ -762,13 +1146,11 @@ impl WmState {
                 if !valid_floating_rect(rect) {
                     return Err(CommandError::InvalidGeometry);
                 }
-                let index = active
-                    .tiled
-                    .iter()
-                    .position(|&id| id == window)
-                    .expect("focused tile");
-                active.tiled.remove(index);
+                active
+                    .detach_tab(window)
+                    .ok_or(CommandError::UnknownWindow)?;
                 active.floating.push(window);
+                active.focused_window = Some(window);
                 self.saved_floating_rects.remove(&window);
                 self.floating_rects.insert(window, rect);
                 Ok(CommandEffect::TileOrderChanged { monitor })
@@ -927,11 +1309,17 @@ impl WmState {
             }
             self.active_monitor = Some(monitor);
         }
-        state
+        let active = state
             .workspaces
             .get_mut(&state.active_workspace)
-            .expect("active workspace must exist")
-            .focused_window = window;
+            .expect("active workspace must exist");
+        if let Some(window) = window
+            && let Some(root) = active.tile_root(window)
+            && let Some(group) = active.groups.get_mut(&root)
+        {
+            group.active = window;
+        }
+        active.focused_window = window;
         true
     }
 
@@ -969,12 +1357,24 @@ impl WmState {
         self.windows.get(&window).copied()
     }
 
-    /// Visibility follows the owning monitor's active workspace.
+    /// Only the selected tab of a group is rendered in its layout slot.
     pub fn is_window_visible(&self, window: WindowId) -> bool {
         let Some(owner) = self.owner(window) else {
             return false;
         };
-        self.active_workspace(owner.monitor) == Some(owner.workspace)
+        if self.active_workspace(owner.monitor) != Some(owner.workspace) {
+            return false;
+        }
+        let Some(state) = self
+            .monitors
+            .get(&owner.monitor)
+            .and_then(|monitor| monitor.workspaces.get(&owner.workspace))
+        else {
+            return false;
+        };
+        state
+            .tile_root(window)
+            .is_none_or(|root| state.selected(root) == window)
     }
 
     pub fn remove_window(&mut self, window: WindowId) -> Option<WindowOwner> {
@@ -2152,6 +2552,311 @@ mod tests {
         );
         assert_eq!(wm.keyboard_focus(), Some(c));
         assert_eq!(order(&wm), vec![a, b, c]);
+    }
+
+    #[test]
+    fn inserting_a_tile_shifts_neighbors_without_changing_focus_or_weights() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let owner = WindowOwner {
+            monitor,
+            workspace: WorkspaceId::FIRST,
+        };
+        let ids: Vec<_> = (0..4).map(|_| wm.add_window(owner).unwrap()).collect();
+        let [a, b, c, d] = [ids[0], ids[1], ids[2], ids[3]];
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        wm.execute(WmCommand::ResizeColumnPair {
+            monitor,
+            left: a,
+            right: b,
+            left_width: 200,
+            right_width: 200,
+            delta: 20,
+        })
+        .unwrap();
+        let weights = wm.column_weights(monitor, WorkspaceId::FIRST);
+        let insert = |window, target, after| WmCommand::InsertTile {
+            monitor,
+            window,
+            target,
+            after,
+        };
+        assert_eq!(
+            wm.execute(insert(d, b, false)),
+            Ok(CommandEffect::TileOrderChanged { monitor })
+        );
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([a, d, b, c].as_slice())
+        );
+        assert_eq!(wm.keyboard_focus(), Some(d));
+        assert_eq!(wm.execute(insert(d, a, true)), Ok(CommandEffect::Unchanged));
+        assert_eq!(
+            wm.execute(insert(a, d, false)),
+            Ok(CommandEffect::Unchanged)
+        );
+        assert_eq!(
+            wm.execute(insert(a, c, true)),
+            Ok(CommandEffect::TileOrderChanged { monitor })
+        );
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([d, b, c, a].as_slice())
+        );
+        assert_eq!(
+            wm.column_weights(monitor, WorkspaceId::FIRST),
+            Some(vec![1000, weights.unwrap()[1], 1000, 1100])
+        );
+        assert_eq!(
+            wm.execute(insert(a, a, false)),
+            Ok(CommandEffect::Unchanged)
+        );
+        assert_eq!(
+            wm.execute(insert(a, WindowId(u64::MAX), false)),
+            Err(CommandError::UnknownWindow)
+        );
+        let other = wm.add_monitor();
+        let other_tile = wm
+            .add_window(WindowOwner {
+                monitor: other,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        assert_eq!(
+            wm.execute(insert(a, other_tile, false)),
+            Err(CommandError::UnknownWindow)
+        );
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([d, b, c, a].as_slice())
+        );
+    }
+
+    #[test]
+    fn grouping_cycles_detaches_and_preserves_one_layout_slot() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let owner = WindowOwner {
+            monitor,
+            workspace: WorkspaceId::FIRST,
+        };
+        let a = wm.add_window(owner).unwrap();
+        let b = wm.add_window(owner).unwrap();
+        let c = wm.add_window(owner).unwrap();
+        assert_eq!(
+            wm.execute(WmCommand::GroupTile {
+                monitor,
+                window: a,
+                target: b
+            }),
+            Ok(CommandEffect::TileOrderChanged { monitor })
+        );
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([b, c].as_slice())
+        );
+        assert_eq!(wm.group_tabs(b), Some(vec![b, a]));
+        assert_eq!(wm.keyboard_focus(), Some(a));
+        assert!(!wm.is_window_visible(b));
+        assert!(wm.is_window_visible(a));
+        wm.execute(WmCommand::CycleGroupTab { monitor }).unwrap();
+        assert_eq!(wm.keyboard_focus(), Some(b));
+        assert!(wm.is_window_visible(b));
+        assert!(!wm.is_window_visible(a));
+        wm.execute(WmCommand::GroupTile {
+            monitor,
+            window: c,
+            target: a,
+        })
+        .unwrap();
+        assert_eq!(wm.group_tabs(b), Some(vec![b, a, c]));
+        wm.execute(WmCommand::DetachFocusedTab { monitor }).unwrap();
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([b, c].as_slice())
+        );
+        assert_eq!(wm.group_tabs(b), Some(vec![b, a]));
+        wm.remove_window(b);
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([a, c].as_slice())
+        );
+        assert_eq!(wm.group_tabs(a), Some(vec![a]));
+    }
+
+    #[test]
+    fn grouped_tabs_support_keyboard_navigation_floating_and_collapse() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let owner = WindowOwner {
+            monitor,
+            workspace: WorkspaceId::FIRST,
+        };
+        let a = wm.add_window(owner).unwrap();
+        let b = wm.add_window(owner).unwrap();
+        let c = wm.add_window(owner).unwrap();
+        assert_eq!(
+            wm.execute(WmCommand::CycleGroupTab { monitor }),
+            Ok(CommandEffect::Unchanged)
+        );
+        wm.set_focus(monitor, Some(a));
+        wm.execute(WmCommand::GroupFocusedWithNext { monitor })
+            .unwrap();
+        assert_eq!(wm.group_tabs(b), Some(vec![b, a]));
+        wm.execute(WmCommand::GroupTile {
+            monitor,
+            window: c,
+            target: b,
+        })
+        .unwrap();
+        assert_eq!(wm.group_tabs(b), Some(vec![b, a, c]));
+        wm.execute(WmCommand::CycleGroupTab { monitor }).unwrap();
+        assert_eq!(wm.keyboard_focus(), Some(b));
+        wm.execute(WmCommand::FocusTile {
+            monitor,
+            direction: Direction::Next,
+        })
+        .unwrap();
+        assert_eq!(wm.keyboard_focus(), Some(b)); // One group is one tile.
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        })
+        .unwrap();
+        assert_eq!(wm.group_tabs(a), Some(vec![a, c]));
+        assert!(wm.floating_rect(b).is_some());
+        wm.set_focus(monitor, Some(a));
+        wm.execute(WmCommand::DetachFocusedTab { monitor }).unwrap();
+        assert_eq!(wm.group_tabs(c), Some(vec![c]));
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([c, a].as_slice())
+        );
+        wm.remove_window(c);
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([a].as_slice())
+        );
+    }
+
+    #[test]
+    fn output_migration_preserves_group_tabs_and_selection() {
+        let mut wm = WmState::new();
+        let source = wm.add_monitor();
+        let target = wm.add_monitor();
+        let owner = WindowOwner {
+            monitor: source,
+            workspace: WorkspaceId::FIRST,
+        };
+        let a = wm.add_window(owner).unwrap();
+        let b = wm.add_window(owner).unwrap();
+        wm.execute(WmCommand::GroupTile {
+            monitor: source,
+            window: b,
+            target: a,
+        })
+        .unwrap();
+        wm.evacuate_monitor(
+            source,
+            Some((
+                target,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 500,
+                    height: 500,
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(wm.group_tabs(a), Some(vec![a, b]));
+        assert_eq!(wm.selected_tile(a), Some(b));
+        assert_eq!(
+            wm.tiled_windows(target, WorkspaceId::FIRST),
+            Some([a].as_slice())
+        );
+        assert!(wm.is_window_visible(b));
+        assert!(!wm.is_window_visible(a));
+    }
+
+    #[test]
+    fn closing_group_root_keeps_its_column_weight_and_selected_tab() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let owner = WindowOwner {
+            monitor,
+            workspace: WorkspaceId::FIRST,
+        };
+        let a = wm.add_window(owner).unwrap();
+        let b = wm.add_window(owner).unwrap();
+        let c = wm.add_window(owner).unwrap();
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        wm.execute(WmCommand::ResizeColumnPair {
+            monitor,
+            left: a,
+            right: b,
+            left_width: 200,
+            right_width: 200,
+            delta: 20,
+        })
+        .unwrap();
+        let weight = wm.column_weights(monitor, WorkspaceId::FIRST).unwrap()[0];
+        wm.execute(WmCommand::GroupTile {
+            monitor,
+            window: b,
+            target: a,
+        })
+        .unwrap();
+        wm.remove_window(a);
+        assert_eq!(
+            wm.tiled_windows(monitor, WorkspaceId::FIRST),
+            Some([b, c].as_slice())
+        );
+        assert_eq!(
+            wm.column_weights(monitor, WorkspaceId::FIRST).unwrap()[0],
+            weight
+        );
+        assert_eq!(wm.keyboard_focus(), Some(b));
+    }
+
+    #[test]
+    fn dropping_either_tab_onto_its_own_content_detaches_it() {
+        for detach_root in [false, true] {
+            let mut wm = WmState::new();
+            let monitor = wm.add_monitor();
+            let owner = WindowOwner {
+                monitor,
+                workspace: WorkspaceId::FIRST,
+            };
+            let a = wm.add_window(owner).unwrap();
+            let b = wm.add_window(owner).unwrap();
+            wm.execute(WmCommand::GroupTile {
+                monitor,
+                window: b,
+                target: a,
+            })
+            .unwrap();
+            let window = if detach_root { a } else { b };
+            wm.execute(WmCommand::InsertTile {
+                monitor,
+                window,
+                target: a,
+                after: true,
+            })
+            .unwrap();
+            let remaining = if detach_root { b } else { a };
+            assert_eq!(
+                wm.tiled_windows(monitor, WorkspaceId::FIRST),
+                Some([remaining, window].as_slice())
+            );
+            assert_eq!(wm.group_tabs(remaining), Some(vec![remaining]));
+            assert_eq!(wm.keyboard_focus(), Some(window));
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Validated TOML shortcuts, layout gaps, terminal command and native startup output settings.
+//! Validated TOML shortcuts, layout, colors, terminal command and native startup output settings.
 
 use std::{
     collections::HashMap,
@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use smithay::input::keyboard::{Keysym, ModifiersState, keysyms, xkb};
 
 use crate::wm::{Direction, WorkspaceId};
@@ -22,8 +22,12 @@ pub enum Action {
     AdjustMasterRatio(Direction),
     ToggleFloating,
     LaunchTerminal,
+    LaunchMenu,
     CloseFocused,
     ToggleTilingMode,
+    GroupFocusedWithNext,
+    DetachFocusedTab,
+    CycleGroupTab,
 }
 
 /// Native output startup request; `None` uses the connector's preferred mode.
@@ -197,6 +201,85 @@ struct FileConfig {
     outputs: HashMap<String, OutputConfig>,
     #[serde(default)]
     layout: LayoutConfig,
+    #[serde(default)]
+    colors: DecorationColors,
+    #[serde(default)]
+    fonts: TitleFontSettings,
+}
+
+/// Server-drawn titlebar text; an omitted family retains the bundled face.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TitleFontSettings {
+    pub family: Option<String>,
+    pub size: u16,
+}
+
+impl Default for TitleFontSettings {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: 14,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HexColor(pub [u8; 3]);
+
+impl HexColor {
+    pub fn rgba(self) -> [u8; 4] {
+        [self.0[0], self.0[1], self.0[2], 255]
+    }
+
+    pub fn solid(self) -> [f32; 4] {
+        [
+            f32::from(self.0[0]) / 255.0,
+            f32::from(self.0[1]) / 255.0,
+            f32::from(self.0[2]) / 255.0,
+            1.0,
+        ]
+    }
+}
+
+impl<'de> Deserialize<'de> for HexColor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let digits = value
+            .strip_prefix('#')
+            .ok_or_else(|| de::Error::custom("expected a quoted #RRGGBB hex color"))?;
+        if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(de::Error::custom("expected a quoted #RRGGBB hex color"));
+        }
+        let bytes = std::array::from_fn(|index| {
+            u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16)
+                .expect("validated ASCII hex digits")
+        });
+        Ok(Self(bytes))
+    }
+}
+
+/// Dracula palette for compositor-drawn decorations; clients draw their own CSD.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecorationColors {
+    pub focused_border: HexColor,
+    pub unfocused_border: HexColor,
+    pub focused_titlebar: HexColor,
+    pub unfocused_titlebar: HexColor,
+    pub title_text: HexColor,
+}
+
+impl Default for DecorationColors {
+    fn default() -> Self {
+        Self {
+            focused_border: HexColor([0xbd, 0x93, 0xf9]),   // Purple
+            unfocused_border: HexColor([0x62, 0x72, 0xa4]), // Comment
+            focused_titlebar: HexColor([0x44, 0x47, 0x5a]), // Current line
+            unfocused_titlebar: HexColor([0x28, 0x2a, 0x36]), // Background
+            title_text: HexColor([0xf8, 0xf8, 0xf2]),       // Foreground
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -246,6 +329,8 @@ pub struct Keybindings {
     terminal: TerminalConfig,
     outputs: HashMap<String, OutputSettings>,
     layout: LayoutConfig,
+    colors: DecorationColors,
+    fonts: TitleFontSettings,
 }
 
 impl Default for Keybindings {
@@ -272,6 +357,20 @@ impl Keybindings {
             }
         }
         keys.layout = file.layout;
+        keys.colors = file.colors;
+        if !(8..=20).contains(&file.fonts.size) {
+            return Err(ConfigError(
+                "fonts.size must be 8–20 logical pixels (titlebars are 24 pixels high)".into(),
+            ));
+        }
+        if let Some(family) = &file.fonts.family
+            && (family.trim().is_empty()
+                || family.len() > 128
+                || family.chars().any(char::is_control))
+        {
+            return Err(ConfigError("fonts.family must be a nonempty font family name without control characters (at most 128 bytes)".into()));
+        }
+        keys.fonts = file.fonts;
         for (name, config) in file.outputs {
             if !valid_output_name(&name) {
                 return Err(ConfigError(format!(
@@ -328,6 +427,14 @@ impl Keybindings {
         (self.layout.inner_gap, self.layout.outer_gap)
     }
 
+    pub fn decoration_colors(&self) -> DecorationColors {
+        self.colors
+    }
+
+    pub fn title_font_settings(&self) -> &TitleFontSettings {
+        &self.fonts
+    }
+
     fn from_overrides(
         mut overrides: HashMap<String, String>,
         terminal: TerminalConfig,
@@ -368,8 +475,12 @@ impl Keybindings {
             ),
             (Action::ToggleFloating, "Alt+space".to_owned()),
             (Action::LaunchTerminal, "Alt+Shift+Return".to_owned()),
-            (Action::CloseFocused, "Alt+Ctrl+q".to_owned()),
+            (Action::LaunchMenu, "Alt+p".to_owned()),
+            (Action::CloseFocused, "Alt+Shift+q".to_owned()),
             (Action::ToggleTilingMode, "Alt+t".to_owned()),
+            (Action::GroupFocusedWithNext, "Alt+g".to_owned()),
+            (Action::DetachFocusedTab, "Alt+Shift+g".to_owned()),
+            (Action::CycleGroupTab, "Alt+Tab".to_owned()),
         ]);
         let mut bindings = HashMap::new();
         for (action, default) in named {
@@ -402,6 +513,8 @@ impl Keybindings {
             terminal,
             outputs: HashMap::new(),
             layout: LayoutConfig::default(),
+            colors: DecorationColors::default(),
+            fonts: TitleFontSettings::default(),
         })
     }
 }
@@ -421,8 +534,12 @@ fn action_name(action: Action) -> String {
         Action::AdjustMasterRatio(Direction::Next) => "grow-master".into(),
         Action::ToggleFloating => "toggle-floating".into(),
         Action::LaunchTerminal => "launch-terminal".into(),
+        Action::LaunchMenu => "launch-menu".into(),
         Action::CloseFocused => "close-focused".into(),
         Action::ToggleTilingMode => "toggle-tiling-mode".into(),
+        Action::GroupFocusedWithNext => "group-next".into(),
+        Action::DetachFocusedTab => "detach-tab".into(),
+        Action::CycleGroupTab => "next-group-tab".into(),
     }
 }
 
@@ -447,6 +564,43 @@ fn default_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titlebar_font_defaults_partial_overrides_and_invalid_values() {
+        assert_eq!(
+            Keybindings::default().title_font_settings(),
+            &TitleFontSettings::default()
+        );
+        assert_eq!(
+            Keybindings::parse("[fonts]\nsize = 18\n")
+                .unwrap()
+                .title_font_settings(),
+            &TitleFontSettings {
+                family: None,
+                size: 18
+            }
+        );
+        assert_eq!(
+            Keybindings::parse("[fonts]\nfamily = 'Iosevka'\n")
+                .unwrap()
+                .title_font_settings(),
+            &TitleFontSettings {
+                family: Some("Iosevka".into()),
+                size: 14
+            }
+        );
+        for invalid in [
+            "[fonts]\nsize = 0\n",
+            "[fonts]\nsize = 21\n",
+            "[fonts]\nsize = 12.5\n",
+            "[fonts]\nfamily = ''\n",
+            "[fonts]\nfamily = '   '\n",
+            "[fonts]\nfamily = \"A\\nB\"\n",
+            "[fonts]\nweight = 'bold'\n",
+        ] {
+            assert!(Keybindings::parse(invalid).is_err(), "accepted: {invalid}");
+        }
+    }
 
     #[test]
     fn native_output_settings_default_and_validate_requests() {
@@ -552,24 +706,40 @@ mod tests {
             keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Return)),
             Some(Action::LaunchTerminal)
         );
-        let ctrl_alt = ModifiersState {
-            alt: true,
-            ctrl: true,
-            ..Default::default()
-        };
         assert_eq!(
-            keys.lookup(&ctrl_alt, Keysym::new(keysyms::KEY_q)),
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_p)),
+            Some(Action::LaunchMenu)
+        );
+        assert_eq!(
+            keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Q)),
             Some(Action::CloseFocused)
         );
         assert_eq!(
             keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_t)),
             Some(Action::ToggleTilingMode)
         );
+        assert_eq!(
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_g)),
+            Some(Action::GroupFocusedWithNext)
+        );
+        assert_eq!(
+            keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_G)),
+            Some(Action::DetachFocusedTab)
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, false), Keysym::new(keysyms::KEY_Tab)),
+            Some(Action::CycleGroupTab)
+        );
         assert_eq!(keys.terminal_command(), ("alacritty", &[][..]));
     }
 
     #[test]
     fn close_focused_binding_can_be_overridden_and_conflicts_are_rejected() {
+        let defaults = Keybindings::default();
+        assert_eq!(
+            defaults.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Q)),
+            Some(Action::CloseFocused)
+        );
         let keys = Keybindings::parse("[keybindings]\nclose-focused = 'Super+q'\n").unwrap();
         let logo = ModifiersState {
             logo: true,
@@ -583,7 +753,7 @@ mod tests {
             keys.lookup(
                 &ModifiersState {
                     alt: true,
-                    ctrl: true,
+                    shift: true,
                     ..Default::default()
                 },
                 Keysym::new(keysyms::KEY_q)
@@ -605,6 +775,40 @@ mod tests {
             None
         );
         assert!(Keybindings::parse("[keybindings]\ntoggle-tiling-mode = 'Alt+j'\n").is_err());
+    }
+
+    #[test]
+    fn group_shortcuts_can_be_overridden_and_conflicts_are_rejected() {
+        let keys = Keybindings::parse(
+            "[keybindings]\ngroup-next = 'Super+g'\ndetach-tab = 'Super+Shift+g'\nnext-group-tab = 'Super+Tab'\n",
+        ).unwrap();
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_g)),
+            Some(Action::GroupFocusedWithNext)
+        );
+        assert_eq!(
+            keys.lookup(&mods(true, true), Keysym::new(keysyms::KEY_G)),
+            Some(Action::DetachFocusedTab)
+        );
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_Tab)),
+            Some(Action::CycleGroupTab)
+        );
+        assert!(Keybindings::parse("[keybindings]\ngroup-next = 'Alt+j'\n").is_err());
+    }
+
+    #[test]
+    fn menu_binding_can_be_overridden_without_changing_terminal() {
+        let keys = Keybindings::parse("[keybindings]\nlaunch-menu = 'Super+p'\n").unwrap();
+        assert_eq!(
+            keys.lookup(&mods(false, true), Keysym::new(keysyms::KEY_p)),
+            Some(Action::LaunchMenu)
+        );
+        assert_eq!(
+            keys.lookup(&mods(true, false), Keysym::new(keysyms::KEY_Return)),
+            Some(Action::LaunchTerminal)
+        );
+        assert!(Keybindings::parse("[keybindings]\nlaunch-menu = 'Alt+j'\n").is_err());
     }
 
     #[test]
@@ -665,6 +869,41 @@ mod tests {
         ] {
             assert!(Keybindings::parse(text).is_err(), "accepted: {text}");
         }
+    }
+
+    #[test]
+    fn decoration_colors_default_to_dracula_and_allow_partial_overrides() {
+        let defaults = DecorationColors::default();
+        assert_eq!(Keybindings::default().decoration_colors(), defaults);
+        assert_eq!(
+            Keybindings::parse("").unwrap().decoration_colors(),
+            defaults
+        );
+        assert_eq!(defaults.focused_border.rgba(), [0xbd, 0x93, 0xf9, 255]);
+        assert_eq!(defaults.unfocused_border.rgba(), [0x62, 0x72, 0xa4, 255]);
+        assert_eq!(defaults.focused_titlebar.rgba(), [0x44, 0x47, 0x5a, 255]);
+        assert_eq!(defaults.unfocused_titlebar.rgba(), [0x28, 0x2a, 0x36, 255]);
+        assert_eq!(defaults.title_text.rgba(), [0xf8, 0xf8, 0xf2, 255]);
+        let colors = Keybindings::parse("[colors]\nfocused_border = '#aBc123'\n")
+            .unwrap()
+            .decoration_colors();
+        assert_eq!(colors.focused_border.rgba(), [0xab, 0xc1, 0x23, 255]);
+        assert_eq!(colors.unfocused_border, defaults.unfocused_border);
+        assert_eq!(colors.focused_titlebar, defaults.focused_titlebar);
+        assert_eq!(colors.unfocused_titlebar, defaults.unfocused_titlebar);
+        assert_eq!(colors.title_text, defaults.title_text);
+        for value in [
+            "'#abc'",
+            "'#00112233'",
+            "'001122'",
+            "'#zz0033'",
+            "'#12 345'",
+            "123456",
+        ] {
+            let text = format!("[colors]\nfocused_border = {value}\n");
+            assert!(Keybindings::parse(&text).is_err(), "accepted: {text}");
+        }
+        assert!(Keybindings::parse("[colors]\nunknown = '#112233'\n").is_err());
     }
 
     #[test]

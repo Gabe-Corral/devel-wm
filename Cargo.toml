@@ -19,3 +19,6 @@ xcursor = "0.3"
 smithay = { version = "=0.7.0", default-features = false, features = ["backend_winit", "desktop", "wayland_frontend"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+smithay = { path = "vendor/smithay" }

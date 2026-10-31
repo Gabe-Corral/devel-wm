@@ -20,7 +20,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::wm::{MonitorId, WmState};
+use crate::wm::{MonitorId, WindowId, WmState};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Snapshot {
@@ -34,6 +34,7 @@ pub struct MonitorSnapshot {
     pub id: u64,
     pub name: String,
     pub active_workspace: u32,
+    pub focused_title: Option<String>,
     pub workspaces: Vec<WorkspaceSnapshot>,
 }
 
@@ -46,9 +47,17 @@ pub struct WorkspaceSnapshot {
 }
 
 impl Snapshot {
-    pub fn from_wm(wm: &WmState, mut output_name: impl FnMut(MonitorId) -> String) -> Self {
+    pub fn from_wm(wm: &WmState, output_name: impl FnMut(MonitorId) -> String) -> Self {
+        Self::from_wm_with_titles(wm, output_name, |_| None)
+    }
+
+    pub fn from_wm_with_titles(
+        wm: &WmState,
+        mut output_name: impl FnMut(MonitorId) -> String,
+        mut title_for_window: impl FnMut(WindowId) -> Option<String>,
+    ) -> Self {
         Self {
-            version: 1,
+            version: 2,
             active_monitor: wm.active_monitor().map(MonitorId::number),
             monitors: wm
                 .monitors()
@@ -59,14 +68,23 @@ impl Snapshot {
                         .active_workspace(monitor)
                         .expect("monitor has active workspace")
                         .number(),
+                    focused_title: wm
+                        .active_workspace(monitor)
+                        .and_then(|workspace| wm.focused_window(monitor, workspace))
+                        .and_then(&mut title_for_window)
+                        .map(|title| sanitize_title(&title)),
                     workspaces: wm
                         .workspaces(monitor)
                         .map(|workspace| {
                             let tiled = wm.tiled_windows(monitor, workspace).expect("workspace");
                             let floating =
                                 wm.floating_windows(monitor, workspace).expect("workspace");
-                            let windows: Vec<_> =
-                                tiled.iter().chain(floating).map(|id| id.number()).collect();
+                            let windows: Vec<_> = tiled
+                                .iter()
+                                .flat_map(|&root| wm.group_tabs(root).expect("layout slot tabs"))
+                                .chain(floating.iter().copied())
+                                .map(|id| id.number())
+                                .collect();
                             WorkspaceSnapshot {
                                 id: workspace.number(),
                                 occupied: !windows.is_empty(),
@@ -80,6 +98,20 @@ impl Snapshot {
                 })
                 .collect(),
         }
+    }
+}
+
+fn sanitize_title(title: &str) -> String {
+    let title: String = title
+        .chars()
+        .take(400)
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect();
+    if title.trim().is_empty() {
+        "Untitled".into()
+    } else {
+        title
     }
 }
 
@@ -294,6 +326,8 @@ mod tests {
         })
         .unwrap();
         let snapshot = Snapshot::from_wm(&wm, |id| format!("output-{}", id.number()));
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.monitors[0].focused_title, None);
         assert_eq!(snapshot.active_monitor, Some(first.number()));
         assert!(!snapshot.monitors[0].workspaces[0].occupied);
         assert_eq!(
@@ -307,6 +341,83 @@ mod tests {
         assert_eq!(snapshot.monitors[1].id, second.number());
         assert!(!snapshot.monitors[1].workspaces[0].occupied);
         assert!(encode(&snapshot).ends_with('\n'));
+    }
+
+    #[test]
+    fn focused_titles_follow_each_outputs_active_workspace_and_are_bounded() {
+        let mut wm = WmState::new();
+        let first = wm.add_monitor();
+        let second = wm.add_monitor();
+        let first_window = wm
+            .add_window(WindowOwner {
+                monitor: first,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        let second_window = wm
+            .add_window(WindowOwner {
+                monitor: second,
+                workspace: WorkspaceId::FIRST,
+            })
+            .unwrap();
+        wm.set_focus(first, Some(first_window));
+        wm.set_focus(second, Some(second_window));
+        let snapshot = |wm: &WmState| {
+            Snapshot::from_wm_with_titles(
+                wm,
+                |id| format!("out-{}", id.number()),
+                |id| {
+                    Some(if id == first_window {
+                        "Terminal\nprivate\t".into()
+                    } else {
+                        "Browser".into()
+                    })
+                },
+            )
+        };
+        let current = snapshot(&wm);
+        assert_eq!(
+            current.monitors[0].focused_title.as_deref(),
+            Some("Terminalprivate")
+        );
+        assert_eq!(
+            current.monitors[1].focused_title.as_deref(),
+            Some("Browser")
+        );
+        wm.execute(WmCommand::SwitchWorkspace {
+            monitor: first,
+            workspace: WorkspaceId::new(2).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(snapshot(&wm).monitors[0].focused_title, None);
+        assert_eq!(
+            snapshot(&wm).monitors[1].focused_title.as_deref(),
+            Some("Browser")
+        );
+        assert_eq!(sanitize_title(&"a".repeat(500)).chars().count(), 200);
+        assert_eq!(sanitize_title("\n"), "Untitled");
+    }
+
+    #[test]
+    fn snapshot_includes_hidden_group_tabs_and_the_selected_focus() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let owner = crate::wm::WindowOwner {
+            monitor,
+            workspace: crate::wm::WorkspaceId::FIRST,
+        };
+        let a = wm.add_window(owner).unwrap();
+        let b = wm.add_window(owner).unwrap();
+        wm.execute(crate::wm::WmCommand::GroupTile {
+            monitor,
+            window: b,
+            target: a,
+        })
+        .unwrap();
+        let snapshot = Snapshot::from_wm(&wm, |_| "test".into());
+        let workspace = &snapshot.monitors[0].workspaces[0];
+        assert_eq!(workspace.windows, vec![a.number(), b.number()]);
+        assert_eq!(workspace.focused_window, Some(b.number()));
     }
 
     #[test]
@@ -406,7 +517,7 @@ mod tests {
             }
         }
         let legacy = || Snapshot {
-            version: 1,
+            version: 2,
             active_monitor: wm.active_monitor().map(MonitorId::number),
             monitors: wm
                 .monitors()
@@ -414,6 +525,7 @@ mod tests {
                     id: monitor.number(),
                     name: format!("output-{}", monitor.number()),
                     active_workspace: wm.active_workspace(monitor).unwrap().number(),
+                    focused_title: None,
                     workspaces: wm
                         .workspaces(monitor)
                         .map(|workspace| {

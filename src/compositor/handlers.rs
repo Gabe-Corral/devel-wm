@@ -14,7 +14,7 @@ use smithay::{
         Client, Resource,
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::{Logical, Point, Rectangle, Serial},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -143,6 +143,16 @@ impl CompositorHandler for Compositor {
         while let Some(parent) = get_parent(&root) {
             root = parent;
         }
+        if self.is_locked()
+            && self.lock_screen.as_ref().is_some_and(|session| {
+                session
+                    .surfaces
+                    .values()
+                    .any(|lock| lock.wl_surface() == &root)
+            })
+        {
+            self.needs_repaint = true;
+        }
         let visible = self.surface_affects_visible_scene(&root);
         if let Some(perf) = self.perf.as_mut() {
             perf.commit(visible);
@@ -190,6 +200,11 @@ impl CompositorHandler for Compositor {
                 self.update_usable_area(&output);
             }
             layer.layer_surface().send_pending_configure();
+            if current.keyboard_interactivity
+                == smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive
+            {
+                self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
+            }
         }
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
@@ -253,6 +268,9 @@ impl XdgShellHandler for Compositor {
         seat_resource: wl_seat::WlSeat,
         serial: Serial,
     ) {
+        if self.is_locked() {
+            return;
+        }
         let Some(seat) = Seat::from_resource(&seat_resource).filter(|seat| seat == &self.seat)
         else {
             return;
@@ -314,6 +332,7 @@ impl XdgShellHandler for Compositor {
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
         self.refresh_toplevel_decoration(surface.wl_surface());
+        self.ipc_dirty = true;
     }
 
     fn reposition_request(
@@ -327,6 +346,9 @@ impl XdgShellHandler for Compositor {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat_resource: wl_seat::WlSeat, serial: Serial) {
+        if self.is_locked() {
+            return;
+        }
         let Some(seat) = Seat::from_resource(&seat_resource).filter(|seat| seat == &self.seat)
         else {
             return;
@@ -410,6 +432,12 @@ impl WlrLayerShellHandler for Compositor {
         let output = requested_output
             .as_ref()
             .and_then(smithay::output::Output::from_resource)
+            .or_else(|| {
+                self.space
+                    .outputs()
+                    .find(|output| self.monitor_for_output(output) == self.wm.active_monitor())
+                    .cloned()
+            })
             .or_else(|| self.space.outputs().next().cloned());
         let Some(output) = output else {
             return;
@@ -438,6 +466,7 @@ impl WlrLayerShellHandler for Compositor {
         if let Some(entry) = self.layers.remove(surface.wl_surface()) {
             layer_map_for_output(&entry.output).unmap_layer(&entry.layer);
             self.update_usable_area(&entry.output);
+            self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
         }
     }
 }

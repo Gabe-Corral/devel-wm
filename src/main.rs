@@ -301,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || last_fallback_cleanup.elapsed() >= std::time::Duration::from_secs(5)
         {
             data.compositor.cleanup_windows();
-            data.compositor.reap_terminal_children();
+            data.compositor.reap_launched_children();
             last_fallback_cleanup = Instant::now();
         }
         let after_cleanup = measured.then(Instant::now);

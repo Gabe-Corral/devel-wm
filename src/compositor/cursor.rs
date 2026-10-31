@@ -173,6 +173,7 @@ smithay::backend::renderer::element::render_elements! {
     pub CursorElements<R> where R: ImportAll + ImportMem;
     Surface=WaylandSurfaceRenderElement<R>,
     Arrow=MemoryRenderBufferRenderElement<R>,
+    Indicator=smithay::backend::renderer::element::solid::SolidColorRenderElement,
 }
 
 impl Cursor {
@@ -286,11 +287,7 @@ mod tests {
         assert_eq!(pixels.len(), (WIDTH * HEIGHT * 4) as usize);
         assert_eq!(&pixels[..4], &[0, 0, 0, 255]);
         assert_eq!(&pixels[4..8], &[0, 0, 0, 0]);
-        assert!(
-            pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel == [255, 255, 255, 255])
-        );
+        assert!(pixels.as_chunks::<4>().0.contains(&[255, 255, 255, 255]));
     }
 
     #[test]
@@ -341,11 +338,20 @@ mod tests {
                 f64::from(physical.yhot) / 2.0
             )
         );
-        assert!(image.pixels_rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
         assert!(
             image
                 .pixels_rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] == 0)
+        );
+        assert!(
+            image
+                .pixels_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] == 255)
         );
     }

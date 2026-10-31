@@ -25,6 +25,16 @@ def cpu_seconds(pid):
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
+def memory_kib(pid):
+    """Current resident set and high-water mark reported by Linux."""
+    status = Path(f"/proc/{pid}/status").read_text()
+    return {key: int(match.group(1)) for key, field in (
+        ("rss_kib", "VmRSS"), ("peak_rss_kib", "VmHWM"),
+        ("anon_rss_kib", "RssAnon"), ("file_rss_kib", "RssFile"),
+        ("shared_rss_kib", "RssShmem"),
+    ) if (match := re.search(rf"^{field}:\s+(\d+) kB$", status, re.M))}
+
+
 def stop(process):
     if process is None or process.poll() is not None:
         return
@@ -46,8 +56,11 @@ def metrics(text):
         "interval_ms", "events", "commits", "visible_commits", "refresh_us",
         "cleanup_us", "ipc_us", "redraw_requests", "frames", "submitted",
         "render_us", "submit_us", "damaged_pixels", "output_pixels",
+        "input_events", "flips", "wayland_dispatches", "resize_updates", "resize_configures",
     )}
-    totals["frame_p95_us_max_interval"] = max((row.get("frame_p95_us", 0) for row in records), default=0)
+    for key in ("frame_p95_us", "input_p95_us", "input_max_us", "flip_p95_us", "flip_max_us",
+                "wayland_p95_us", "wayland_max_us"):
+        totals[f"{key}_max_interval"] = max((row.get(key, 0) for row in records), default=0)
     totals["damage_fraction"] = (totals["damaged_pixels"] / totals["output_pixels"]
                                  if totals["output_pixels"] else None)
     totals["render_submit_us_per_frame"] = ((totals["render_us"] + totals["submit_us"]) / totals["frames"]
@@ -68,9 +81,9 @@ def run(args):
     profile = ["--release"] if args.profile == "release" else []
     subprocess.run(["cargo", "build", "--locked", *profile], cwd=ROOT, check=True)
     if not args.no_bar:
-        subprocess.run(["cargo", "build", "--locked", "--manifest-path", str(ROOT / "bar-test/Cargo.toml")], check=True)
+        subprocess.run(["cargo", "build", "--locked", "--manifest-path", str(ROOT / "../devel-bar/Cargo.toml")], check=True)
     compositor_bin = ROOT / "target" / ("debug" if args.profile == "dev" else "release") / "devel-wm"
-    bar_bin = ROOT / "bar-test/target/debug/prototype-bar"
+    bar_bin = ROOT / "../devel-bar/target/debug/devel-bar"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     log_path = args.output.with_suffix(".log")
     processes = []
@@ -109,6 +122,7 @@ def run(args):
             time.sleep(args.idle)
             idle_elapsed = time.monotonic() - idle_start
             idle_cpu = cpu_seconds(wm.pid) - idle_cpu_start
+            idle_memory = memory_kib(wm.pid)
             idle_text = read_log(log)[idle_offset:]
             workload = (
                 "import time,sys; "
@@ -131,6 +145,7 @@ def run(args):
             time.sleep(args.active)
             active_elapsed = time.monotonic() - active_start
             active_cpu = cpu_seconds(wm.pid) - active_cpu_start
+            active_memory = memory_kib(wm.pid)
             active_text = read_log(log)[active_offset:]
             if wm.poll() is not None:
                 raise RuntimeError(f"compositor stopped during benchmark; see {log_path}")
@@ -141,9 +156,9 @@ def run(args):
                 "clients": 2,
                 "bar": not args.no_bar,
                 "idle": {"seconds": idle_elapsed, "cpu_seconds": idle_cpu, "cpu_percent": idle_cpu / idle_elapsed * 100,
-                         **metrics(idle_text)},
+                         **idle_memory, **metrics(idle_text)},
                 "active": {"seconds": active_elapsed, "cpu_seconds": active_cpu, "cpu_percent": active_cpu / active_elapsed * 100,
-                           **metrics(active_text)},
+                            **active_memory, **metrics(active_text)},
             }
             if result["active"]["commits"] == 0 or result["active"]["frames"] == 0:
                 raise RuntimeError(f"no active client commits or rendered frames; see {log_path}")
@@ -164,8 +179,11 @@ def compare(paths):
     print(f"Baseline: {paths[0]}  Candidate: {paths[1]}")
     for phase in ("idle", "active"):
         print(f"{phase} (lower is better except frames):")
-        for key in ("cpu_percent", "refresh_us", "cleanup_us", "ipc_us", "render_submit_us_per_frame",
-                    "frame_p95_us_max_interval", "redraw_requests", "frames", "damage_fraction"):
+        for key in ("cpu_percent", "rss_kib", "peak_rss_kib", "anon_rss_kib", "file_rss_kib",
+                    "refresh_us", "cleanup_us", "ipc_us",
+                    "render_submit_us_per_frame", "frame_p95_us_max_interval", "input_events",
+                    "input_p95_us_max_interval", "flip_p95_us_max_interval", "wayland_p95_us_max_interval",
+                    "redraw_requests", "frames", "damage_fraction"):
             a, b = before[phase].get(key), after[phase].get(key)
             if a is None or b is None:
                 continue

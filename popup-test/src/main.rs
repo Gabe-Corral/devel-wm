@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit: false,
     };
     println!(
-        "Click the blue content BELOW the titlebar (not the separate prototype bar). Left-click: grabbed popup; left-click green: reposition; right-click green: nested popup; click outside: dismiss; Escape: close; Ctrl-C: exit"
+        "Click the blue content BELOW the titlebar (not the separate bar). Left-click: grabbed popup; left-click green: reposition; right-click green: nested popup; click outside: dismiss; Escape: close; Ctrl-C: exit"
     );
     while !app.exit {
         queue.blocking_dispatch(&mut app)?;

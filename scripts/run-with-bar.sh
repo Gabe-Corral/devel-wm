@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the nested compositor and its prototype layer-shell bar together.
+# Run the nested compositor and devel-bar together.
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -8,7 +8,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/run-with-bar.sh [--alacritty COUNT] [--config PATH]
 
-Launch the nested compositor and prototype bar, optionally with COUNT Alacritty windows.
+Launch the nested compositor and devel-bar, optionally with COUNT Alacritty windows.
 EOF
 }
 
@@ -103,7 +103,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cargo build --locked --manifest-path "$root/Cargo.toml"
-cargo build --locked --manifest-path "$root/bar-test/Cargo.toml"
+cargo build --locked --manifest-path "$root/../devel-bar/Cargo.toml"
 
 # tee preserves startup diagnostics and keeps the compositor's later logs visible.
 "$root/target/debug/devel-wm" "${compositor_args[@]}" > >(tee "$log") 2>&1 &
@@ -135,9 +135,9 @@ if [[ -z $wayland_display || -z $ipc_socket || ! -S $ipc_socket || ! -S $XDG_RUN
 fi
 
 env -u DISPLAY WAYLAND_DISPLAY="$wayland_display" DEVEL_WM_IPC="$ipc_socket" \
-    "$root/bar-test/target/debug/prototype-bar" &
+    "$root/../devel-bar/target/debug/devel-bar" &
 bar_pid=$!
-echo "Prototype bar running on $wayland_display (IPC: $ipc_socket)"
+echo "devel-bar running on $wayland_display (IPC: $ipc_socket)"
 for ((i = 0; i < alacritty_count; i++)); do
     env -u DISPLAY WAYLAND_DISPLAY="$wayland_display" DEVEL_WM_IPC="$ipc_socket" alacritty &
     alacritty_pids+=("$!")

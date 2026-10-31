@@ -3,6 +3,7 @@
 pub(crate) mod cursor;
 pub(crate) mod decorations;
 mod handlers;
+mod locking;
 mod nested;
 
 use std::{
@@ -13,6 +14,10 @@ use std::{
 };
 
 use smithay::{
+    backend::renderer::element::{
+        Kind,
+        solid::{SolidColorBuffer, SolidColorRenderElement},
+    },
     desktop::{
         PopupGrab, PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
         layer_map_for_output,
@@ -26,11 +31,12 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Scale},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         output::OutputManagerState,
         selection::data_device::{DataDeviceState, clear_data_device_selection},
+        session_lock::{LockSurface, SessionLockManagerState, SessionLocker},
         shell::wlr_layer::WlrLayerShellState,
         shell::xdg::XdgShellState,
         shm::ShmState,
@@ -40,7 +46,7 @@ use smithay::{
 };
 
 use cursor::Cursor;
-use decorations::{DecoratedWindow, insets};
+use decorations::{DecoratedWindow, TitleFont, insets};
 pub use nested::{NestedOutput, run_nested};
 
 use crate::config::Keybindings;
@@ -55,6 +61,12 @@ struct LayerEntry {
     output: smithay::output::Output,
     layer: smithay::desktop::LayerSurface,
     layout_state: smithay::wayland::shell::wlr_layer::LayerSurfaceCachedState,
+}
+
+pub(crate) struct LockSession {
+    confirmation: Option<SessionLocker>,
+    surfaces: HashMap<smithay::output::Output, LockSurface>,
+    covered: HashSet<smithay::output::Output>,
 }
 
 struct FloatingDrag {
@@ -84,6 +96,63 @@ struct ColumnResize {
 struct TitleDrag {
     window: Window,
     start: Point<f64, Logical>,
+    started: bool,
+    target: Option<TitleDrop>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TitleDrop {
+    Insert(WindowId, bool, DropEdge),
+    Group(WindowId),
+}
+
+const DROP_INDICATOR_WIDTH: i32 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DropEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// The insertion slot is shown across the whole column/stack, not merely on
+/// the titlebar or border of the tile under the pointer.
+fn drop_indicator_rect(frame: Rect, area: Rect, edge: DropEdge, gap: i32) -> Option<Rect> {
+    let vertical = matches!(edge, DropEdge::Left | DropEdge::Right);
+    let boundary = match edge {
+        DropEdge::Left => frame.x.saturating_sub(gap / 2),
+        DropEdge::Right => frame.x.saturating_add(frame.width).saturating_add(gap / 2),
+        DropEdge::Top => frame.y.saturating_sub(gap / 2),
+        DropEdge::Bottom => frame.y.saturating_add(frame.height).saturating_add(gap / 2),
+    };
+    let (start, end) = if vertical {
+        (area.x, area.x.saturating_add(area.width))
+    } else {
+        (area.y, area.y.saturating_add(area.height))
+    };
+    if end <= start {
+        return None;
+    }
+    let thickness = DROP_INDICATOR_WIDTH.min(end - start);
+    let position = boundary
+        .saturating_sub(thickness / 2)
+        .clamp(start, end - thickness);
+    Some(if vertical {
+        Rect {
+            x: position,
+            y: area.y,
+            width: thickness,
+            height: area.height,
+        }
+    } else {
+        Rect {
+            x: frame.x,
+            y: position,
+            width: frame.width,
+            height: thickness,
+        }
+    })
 }
 
 fn title_drag_exceeded(start: Point<f64, Logical>, position: Point<f64, Logical>) -> bool {
@@ -98,6 +167,20 @@ fn server_decorated(window: &Window) -> bool {
         state.decoration_mode == Some(smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ServerSide)
             && !state.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen)
     })
+}
+
+fn window_title(window: &Window) -> String {
+    window
+        .toplevel()
+        .and_then(|top| {
+            with_states(top.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .and_then(|data| data.lock().ok().and_then(|state| state.title.clone()))
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn global_usable_area(
@@ -174,6 +257,9 @@ pub struct Compositor {
     id_windows: HashMap<WindowId, Window>,
     scene_windows: HashMap<WindowId, DecoratedWindow>,
     surface_windows: HashMap<WlSurface, Window>,
+    // Layout slots can be rooted at a hidden group tab. Never put a slot's
+    // frame in requested_geometry until that particular client is configured.
+    tile_geometry: HashMap<WindowId, Rect>,
     requested_geometry: HashMap<WindowId, Rect>,
     mapped_windows: HashSet<WindowId>,
     activated_window: Option<WindowId>,
@@ -185,9 +271,13 @@ pub struct Compositor {
     #[cfg(feature = "native")]
     deferred_resize_configures: HashSet<WindowId>,
     title_drag: Option<TitleDrag>,
+    drop_indicator: SolidColorBuffer,
     layout_settings: LayoutSettings,
+    title_font: TitleFont,
     pub(crate) keybindings: Keybindings,
-    pub(crate) terminal_children: Vec<std::process::Child>,
+    pub(crate) launched_children: Vec<std::process::Child>,
+    pub(crate) menu_child: Option<std::process::Child>,
+    pub(crate) menu_close_requested: bool,
     pub(crate) intercepted_keys: HashSet<smithay::input::keyboard::Keycode>,
     pub(crate) last_forwarded_key_serial: Option<smithay::utils::Serial>,
     pub(crate) last_forwarded_button_serial: Option<smithay::utils::Serial>,
@@ -200,6 +290,8 @@ pub struct Compositor {
     pub xdg_shell_state: XdgShellState,
     pub decoration_state: smithay::wayland::shell::xdg::decoration::XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
+    pub session_lock_state: SessionLockManagerState,
+    pub(crate) lock_screen: Option<LockSession>,
     pub shm_state: ShmState,
     // Clients can render high-DPI buffers into logical-size surfaces instead
     // of exposing their pixel dimensions as the window's logical bbox.
@@ -214,9 +306,16 @@ pub struct Compositor {
     pub seat: Seat<Self>,
     pub(crate) cursor: Cursor,
     pub(crate) cursor_position: Option<Point<f64, Logical>>,
+    pub(crate) hovered_window: Option<Window>,
 }
 
 impl Compositor {
+    pub(crate) fn menu_is_open(&self) -> bool {
+        self.layers
+            .values()
+            .any(|entry| entry.layer.namespace() == "devel-menu")
+    }
+
     /// Ask the currently focused xdg toplevel to close. The client decides
     /// when to exit (and can prompt to save work); never destroy it here.
     pub(crate) fn close_focused_window(&self) {
@@ -229,11 +328,17 @@ impl Compositor {
     }
 
     fn clear_disconnected_clipboard(&mut self) {
+        let mut disconnected = false;
         for client in self.disconnected_clients.try_iter() {
+            disconnected = true;
             if self.clipboard_owner.as_ref() == Some(&client) {
                 self.clipboard_owner = None;
                 clear_data_device_selection(&self.display_handle, &self.seat);
             }
+        }
+        if disconnected && self.is_locked() {
+            self.needs_repaint = true;
+            self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -262,12 +367,23 @@ impl Compositor {
         false
     }
     pub fn ipc_snapshot(&self) -> crate::ipc::Snapshot {
-        crate::ipc::Snapshot::from_wm(&self.wm, |monitor| {
-            self.output_monitors
-                .iter()
-                .find_map(|(output, &id)| (id == monitor).then(|| output.name()))
-                .unwrap_or_default()
-        })
+        if self.is_locked() {
+            return crate::ipc::Snapshot {
+                version: 2,
+                active_monitor: None,
+                monitors: Vec::new(),
+            };
+        }
+        crate::ipc::Snapshot::from_wm_with_titles(
+            &self.wm,
+            |monitor| {
+                self.output_monitors
+                    .iter()
+                    .find_map(|(output, &id)| (id == monitor).then(|| output.name()))
+                    .unwrap_or_default()
+            },
+            |id| self.id_windows.get(&id).map(window_title),
+        )
     }
 
     pub fn take_ipc_update(&mut self) -> Option<crate::ipc::Snapshot> {
@@ -290,6 +406,12 @@ impl Compositor {
         let decoration_state =
             smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        // Do not advertise a lock protocol before its full security workflow
+        // has been tested with a real locker on nested and native outputs.
+        let experimental_lock =
+            std::env::var("DEVEL_WM_EXPERIMENTAL_SESSION_LOCK").as_deref() == Ok("1");
+        let session_lock_state =
+            SessionLockManagerState::new::<Self, _>(&dh, move |_| experimental_lock);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -348,6 +470,7 @@ impl Compositor {
             id_windows: HashMap::new(),
             scene_windows: HashMap::new(),
             surface_windows: HashMap::new(),
+            tile_geometry: HashMap::new(),
             requested_geometry: HashMap::new(),
             mapped_windows: HashSet::new(),
             activated_window: None,
@@ -359,13 +482,20 @@ impl Compositor {
             #[cfg(feature = "native")]
             deferred_resize_configures: HashSet::new(),
             title_drag: None,
+            drop_indicator: SolidColorBuffer::new(
+                (1, 1),
+                keybindings.decoration_colors().focused_border.solid(),
+            ),
             layout_settings: LayoutSettings {
                 inner_gap,
                 outer_gap,
                 ..LayoutSettings::default()
             },
+            title_font: TitleFont::load(keybindings.title_font_settings()),
             keybindings,
-            terminal_children: Vec::new(),
+            launched_children: Vec::new(),
+            menu_child: None,
+            menu_close_requested: false,
             intercepted_keys: HashSet::new(),
             last_forwarded_key_serial: None,
             last_forwarded_button_serial: None,
@@ -378,6 +508,8 @@ impl Compositor {
             xdg_shell_state,
             decoration_state,
             layer_shell_state,
+            session_lock_state,
+            lock_screen: None,
             shm_state,
             _viewporter_state: viewporter_state,
             output_manager_state,
@@ -390,6 +522,7 @@ impl Compositor {
             seat,
             cursor: Cursor::new(),
             cursor_position: None,
+            hovered_window: None,
         })
     }
 
@@ -397,6 +530,9 @@ impl Compositor {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if self.is_locked() {
+            return self.lock_surface_at(pos);
+        }
         for output in self.space.outputs() {
             let Some(geometry) = self.space.output_geometry(output) else {
                 continue;
@@ -500,7 +636,23 @@ impl Compositor {
         self.wm
             .evacuate_monitor(monitor, survivor)
             .expect("known mapped monitor");
+        // A layer surface is bound to its output. Close and unmap it before
+        // reconnecting this Output, otherwise its old exclusive zone survives
+        // and a restarted bar can reserve the edge twice.
+        self.layers.retain(|_, entry| {
+            if &entry.output == output {
+                layer_map_for_output(output).unmap_layer(&entry.layer);
+                entry.layer.layer_surface().send_close();
+                false
+            } else {
+                true
+            }
+        });
         self.output_monitors.remove(output);
+        if let Some(session) = self.lock_screen.as_mut() {
+            session.surfaces.remove(output);
+            session.covered.remove(output);
+        }
         self.usable_areas.remove(output);
         self.space.unmap_output(output);
         if let Some((survivor, _)) = survivor {
@@ -641,7 +793,12 @@ impl Compositor {
             // place_window reserves decoration insets *inside* this frame.
             // Using placement.content here applied an extra two-pixel inset
             // around both decorated and undecorated tiled windows.
-            self.place_window(placement.window, placement.frame);
+            let selected = self
+                .wm
+                .selected_tile(placement.window)
+                .expect("layout slot");
+            self.tile_geometry.insert(placement.window, placement.frame);
+            self.place_window(selected, placement.frame);
         }
         let floating = self
             .wm
@@ -690,30 +847,28 @@ impl Compositor {
             scene.set_owner_clip(geometry, (frame.x, frame.y).into());
         }
         let stacking_changed = scene.set_floating(self.wm.floating_rect(id).is_some());
-        let decorated = server_decorated(window);
-        let title = window
-            .toplevel()
-            .and_then(|top| {
-                with_states(top.wl_surface(), |states| {
-                    states
-                        .data_map
-                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                        .and_then(|data| data.lock().ok().and_then(|state| state.title.clone()))
+        let tabs = self.wm.group_tabs(id).unwrap_or_default();
+        let grouped = tabs.len() > 1;
+        let decorated = grouped || server_decorated(window);
+        let title = window_title(window);
+        let tabs = if grouped {
+            tabs.into_iter()
+                .filter_map(|tab| {
+                    self.id_windows
+                        .get(&tab)
+                        .map(|window| (window_title(window), tab == id))
                 })
-            })
-            .unwrap_or_default();
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let tabs_changed = scene.set_tabs(tabs);
         let mode_changed = scene.decorated() != decorated;
         if mode_changed {
             tracing::debug!(?id, decorated, "window decoration mode changed");
         }
-        let changed = scene.update(
-            decorated,
-            title,
-            self.wm.keyboard_focus() == Some(id),
-            frame.width,
-            frame.height,
-        );
-        self.needs_repaint |= changed && self.wm.is_window_visible(id);
+        let changed = scene.update(decorated, title, self.wm.keyboard_focus() == Some(id));
+        self.needs_repaint |= changed || tabs_changed;
         let (side, title_height) = insets(decorated);
         let position = (frame.x, frame.y);
         let previous = self.requested_geometry.insert(id, frame);
@@ -739,6 +894,12 @@ impl Compositor {
                 );
             });
             if top.is_initial_configure_sent() {
+                // Count size updates in both nested and native modes. Native
+                // interactive drags may defer/coalesce their configures;
+                // nested mode sends each one immediately.
+                if let Some(perf) = self.perf.as_mut() {
+                    perf.resize_update();
+                }
                 #[cfg(feature = "native")]
                 let defer = self.coalesce_resize_configures
                     && (self
@@ -755,12 +916,13 @@ impl Compositor {
                     #[cfg(feature = "native")]
                     {
                         self.deferred_resize_configures.insert(id);
-                        if let Some(perf) = self.perf.as_mut() {
-                            perf.resize_update();
-                        }
                     }
                 } else {
-                    top.send_pending_configure();
+                    if top.send_pending_configure().is_some()
+                        && let Some(perf) = self.perf.as_mut()
+                    {
+                        perf.resize_configure();
+                    }
                 }
             }
             self.needs_repaint = true;
@@ -845,29 +1007,210 @@ impl Compositor {
         self.title_drag = Some(TitleDrag {
             window: window.clone(),
             start,
+            started: false,
+            target: None,
         });
+    }
+
+    pub(crate) fn title_tab_at(
+        &self,
+        window: &Window,
+        position: Point<f64, Logical>,
+    ) -> Option<Window> {
+        let id = *self.window_ids.get(window)?;
+        let tabs = self.wm.group_tabs(id)?;
+        if tabs.len() < 2 {
+            return Some(window.clone());
+        }
+        let frame = self.requested_geometry.get(&id)?;
+        if frame.width <= 0 {
+            return None;
+        }
+        let x = (position.x - f64::from(frame.x)).floor() as i64;
+        let index = (x.max(0) as usize * tabs.len() / frame.width as usize).min(tabs.len() - 1);
+        self.id_windows.get(&tabs[index]).cloned()
     }
 
     pub fn is_title_drag_pending(&self) -> bool {
         self.title_drag.is_some()
     }
 
-    /// Consume motion over a pressed titlebar; float only after a real drag.
+    /// Keep tiles tiled during an unmodified titlebar drag. Floating windows
+    /// retain the usual titlebar move behavior after the movement threshold.
     pub fn move_title_drag(&mut self, position: Point<f64, Logical>) -> bool {
         let Some(pending) = &self.title_drag else {
             return false;
         };
-        if title_drag_exceeded(pending.start, position) {
-            let pending = self.title_drag.take().expect("pending title drag");
-            if self.begin_floating_drag(&pending.window, pending.start) {
-                self.move_floating_drag(position);
+        if !pending.started {
+            if !title_drag_exceeded(pending.start, position) {
+                return true;
             }
+            let Some(id) = self.window_ids.get(&pending.window).copied() else {
+                self.title_drag = None;
+                return true;
+            };
+            if self.wm.floating_rect(id).is_some() {
+                let pending = self.title_drag.take().expect("pending title drag");
+                if self.begin_floating_drag(&pending.window, pending.start) {
+                    self.move_floating_drag(position);
+                }
+                return true;
+            }
+            self.title_drag
+                .as_mut()
+                .expect("pending title drag")
+                .started = true;
+        }
+        let id = self.window_ids[&self.title_drag.as_ref().expect("title drag").window];
+        let target = self
+            .tile_drop_target(id, position)
+            .map(|(root, after, edge)| {
+                let frame = self.tile_geometry[&root];
+                let selected = self.wm.selected_tile(root).expect("visible target slot");
+                let decorated = self.wm.group_tabs(root).is_some_and(|tabs| tabs.len() > 1)
+                    || self.id_windows.get(&selected).is_some_and(server_decorated);
+                if decorated && position.y < f64::from(frame.y + decorations::TITLE_HEIGHT) {
+                    TitleDrop::Group(root)
+                } else {
+                    TitleDrop::Insert(root, after, edge)
+                }
+            });
+        let previous = self.title_drag.as_ref().expect("title drag").target;
+        if previous != target {
+            self.needs_repaint = true;
+            self.title_drag.as_mut().expect("title drag").target = target;
         }
         true
     }
 
+    fn tile_drop_target(
+        &self,
+        source: WindowId,
+        position: Point<f64, Logical>,
+    ) -> Option<(WindowId, bool, DropEdge)> {
+        let owner = self.wm.owner(source)?;
+        if self.monitor_at(position)? != owner.monitor
+            || self.wm.active_workspace(owner.monitor)? != owner.workspace
+        {
+            return None;
+        }
+        let tiled = self.wm.tiled_windows(owner.monitor, owner.workspace)?;
+        let source_root = self.wm.tile_root(source)?;
+        if !tiled.contains(&source_root) {
+            return None;
+        }
+        let mode = self.wm.tiling_mode(owner.monitor, owner.workspace)?;
+        tiled.iter().enumerate().find_map(|(index, &id)| {
+            let rect = self.tile_geometry.get(&id)?;
+            if position.x < f64::from(rect.x)
+                || position.x >= f64::from(rect.x + rect.width)
+                || position.y < f64::from(rect.y)
+                || position.y >= f64::from(rect.y + rect.height)
+            {
+                return None;
+            }
+            if id == source_root {
+                let group = self.wm.group_tabs(source)?;
+                if group.len() < 2 || position.y < f64::from(rect.y + decorations::TITLE_HEIGHT) {
+                    return None;
+                }
+            }
+            let horizontal = mode == TilingMode::SideBySide || index == 0;
+            let after = if horizontal {
+                position.x >= f64::from(rect.x) + f64::from(rect.width) / 2.0
+            } else {
+                position.y >= f64::from(rect.y) + f64::from(rect.height) / 2.0
+            };
+            let edge = match (horizontal, after) {
+                (true, false) => DropEdge::Left,
+                (true, true) => DropEdge::Right,
+                (false, false) => DropEdge::Top,
+                (false, true) => DropEdge::Bottom,
+            };
+            Some((id, after, edge))
+        })
+    }
+
     pub fn end_title_drag(&mut self) -> bool {
-        self.title_drag.take().is_some()
+        let Some(drag) = self.clear_title_drag() else {
+            return false;
+        };
+        if let Some(target) = drag.target
+            && let Some(&window) = self.window_ids.get(&drag.window)
+            && let Some(owner) = self.wm.owner(window)
+        {
+            let command = match target {
+                TitleDrop::Insert(target, after, _) => WmCommand::InsertTile {
+                    monitor: owner.monitor,
+                    window,
+                    target,
+                    after,
+                },
+                TitleDrop::Group(target) => WmCommand::GroupTile {
+                    monitor: owner.monitor,
+                    window,
+                    target,
+                },
+            };
+            let _ = self.apply_command(command);
+        }
+        true
+    }
+
+    fn clear_title_drag(&mut self) -> Option<TitleDrag> {
+        let drag = self.title_drag.take()?;
+        if drag.target.is_some() {
+            self.needs_repaint = true;
+        }
+        Some(drag)
+    }
+
+    pub(crate) fn drop_indicator_element(
+        &mut self,
+        output: &smithay::output::Output,
+    ) -> Option<SolidColorRenderElement> {
+        let drag = self.title_drag.as_ref()?;
+        let target = drag.target?;
+        let source = *self.window_ids.get(&drag.window)?;
+        let owner = self.wm.owner(source)?;
+        if self.output_monitors.get(output) != Some(&owner.monitor)
+            || self.wm.active_workspace(owner.monitor) != Some(owner.workspace)
+        {
+            return None;
+        }
+        let geometry = self.space.output_geometry(output)?;
+        let area = global_usable_area(*self.usable_areas.get(output)?, geometry.loc);
+        let area = Rect {
+            x: area.loc.x,
+            y: area.loc.y,
+            width: area.size.w,
+            height: area.size.h,
+        };
+        let root = match target {
+            TitleDrop::Insert(root, ..) | TitleDrop::Group(root) => root,
+        };
+        let frame = *self.tile_geometry.get(&root)?;
+        let rect = match target {
+            TitleDrop::Insert(_, _, edge) => {
+                drop_indicator_rect(frame, area, edge, self.layout_settings.inner_gap)?
+            }
+            TitleDrop::Group(_) => Rect {
+                x: frame.x,
+                y: frame.y,
+                width: frame.width,
+                height: decorations::TITLE_HEIGHT.min(frame.height),
+            },
+        };
+        self.drop_indicator.resize((rect.width, rect.height));
+        let scale = output.current_scale().fractional_scale();
+        Some(SolidColorRenderElement::from_buffer(
+            &self.drop_indicator,
+            Point::<i32, Logical>::from((rect.x - geometry.loc.x, rect.y - geometry.loc.y))
+                .to_physical_precise_round(Scale::from(scale)),
+            Scale::from(scale),
+            1.0,
+            Kind::Unspecified,
+        ))
     }
 
     pub fn move_floating_drag(&mut self, position: Point<f64, Logical>) {
@@ -936,12 +1279,12 @@ impl Compositor {
         delta: i32,
     ) -> Result<CommandEffect, CommandError> {
         let left_width = self
-            .requested_geometry
+            .tile_geometry
             .get(&left)
             .ok_or(CommandError::InvalidGeometry)?
             .width;
         let right_width = self
-            .requested_geometry
+            .tile_geometry
             .get(&right)
             .ok_or(CommandError::InvalidGeometry)?
             .width;
@@ -972,7 +1315,8 @@ impl Compositor {
             .wm
             .focused_window(monitor, workspace)
             .ok_or(CommandError::NoFocusedWindow)?;
-        let Some(index) = tiles.iter().position(|&id| id == focused) else {
+        let root = self.wm.tile_root(focused).unwrap_or(focused);
+        let Some(index) = tiles.iter().position(|&id| id == root) else {
             return Ok(CommandEffect::Unchanged);
         };
         if tiles.len() < 2 {
@@ -984,12 +1328,12 @@ impl Compositor {
             (tiles[index - 1], tiles[index], false)
         };
         let total = i64::from(
-            self.requested_geometry
+            self.tile_geometry
                 .get(&left)
                 .ok_or(CommandError::InvalidGeometry)?
                 .width,
         ) + i64::from(
-            self.requested_geometry
+            self.tile_geometry
                 .get(&right)
                 .ok_or(CommandError::InvalidGeometry)?
                 .width,
@@ -1011,8 +1355,8 @@ impl Compositor {
         }
         let tiles = self.wm.tiled_windows(monitor, workspace)?;
         tiles.windows(2).find_map(|pair| {
-            let left = self.requested_geometry.get(&pair[0])?;
-            let right = self.requested_geometry.get(&pair[1])?;
+            let left = self.tile_geometry.get(&pair[0])?;
+            let right = self.tile_geometry.get(&pair[1])?;
             let edge = (f64::from(left.x + left.width) + f64::from(right.x)) / 2.0;
             (position.x >= edge - 4.0
                 && position.x <= edge + 4.0
@@ -1156,35 +1500,50 @@ impl Compositor {
     #[cfg(feature = "native")]
     pub(crate) fn flush_resize_configure(&mut self) {
         for id in self.deferred_resize_configures.drain() {
-            if let Some(top) = self.id_windows.get(&id).and_then(Window::toplevel) {
-                top.send_pending_configure();
-                if let Some(perf) = self.perf.as_mut() {
-                    perf.resize_configure();
-                }
+            if let Some(top) = self.id_windows.get(&id).and_then(Window::toplevel)
+                && top.send_pending_configure().is_some()
+                && let Some(perf) = self.perf.as_mut()
+            {
+                perf.resize_configure();
             }
         }
     }
 
-    pub fn register_window(&mut self, window: &Window) {
-        let monitor = self.wm.active_monitor().expect("mapped output");
+    fn owner_for_new_window(&mut self) -> WindowOwner {
+        // Hovering a bar or empty desktop does not change keyboard focus, but
+        // new windows should still open on the output under the pointer.
+        let monitor = self
+            .cursor_position
+            .and_then(|position| self.monitor_at(position))
+            .or_else(|| self.wm.active_monitor())
+            .expect("mapped output");
+        self.wm.set_active_monitor(monitor);
         let workspace = self
             .wm
             .active_workspace(monitor)
             .expect("registered monitor");
-        let id = self
-            .wm
-            .add_window(WindowOwner { monitor, workspace })
-            .expect("active workspace exists");
+        WindowOwner { monitor, workspace }
+    }
+
+    pub fn register_window(&mut self, window: &Window) {
+        let owner = self.owner_for_new_window();
+        let id = self.wm.add_window(owner).expect("active workspace exists");
         self.window_ids.insert(window.clone(), id);
         self.id_windows.insert(id, window.clone());
-        self.scene_windows
-            .insert(id, DecoratedWindow::new(window.clone()));
+        self.scene_windows.insert(
+            id,
+            DecoratedWindow::new(
+                window.clone(),
+                self.keybindings.decoration_colors(),
+                self.title_font.clone(),
+            ),
+        );
         if let Some(top) = window.toplevel() {
             self.surface_windows
                 .insert(top.wl_surface().clone(), window.clone());
         }
         self.ipc_dirty = true;
-        self.layout_monitor(monitor);
+        self.layout_monitor(owner.monitor);
         self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
     }
 
@@ -1201,11 +1560,18 @@ impl Compositor {
         }
         match effect {
             CommandEffect::Unchanged => {}
-            CommandEffect::FocusChanged { .. } => {
-                self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
+            CommandEffect::FocusChanged { monitor } => {
+                if matches!(
+                    command,
+                    WmCommand::CycleGroupTab { .. } | WmCommand::ActivateGroupTab { .. }
+                ) {
+                    self.reconcile_monitor(monitor);
+                } else {
+                    self.sync_keyboard_focus(SERIAL_COUNTER.next_serial());
+                }
             }
             CommandEffect::TileOrderChanged { monitor } => {
-                self.layout_monitor(monitor);
+                self.reconcile_monitor(monitor);
                 if matches!(
                     command,
                     WmCommand::ToggleFocusedFloating { .. } | WmCommand::FloatFocusedAt { .. }
@@ -1270,7 +1636,15 @@ impl Compositor {
         self.sync_keyboard_focus(serial);
         let pointer = self.seat.get_pointer().expect("pointer");
         let location = pointer.current_location();
-        let under = self.surface_under(location);
+        let under = if self.is_title_drag_pending()
+            || self.is_floating_drag_active()
+            || self.is_floating_resize_active()
+            || self.is_column_resize_active()
+        {
+            None
+        } else {
+            self.surface_under(location)
+        };
         let time = self.start_time.elapsed().as_millis() as u32;
         pointer.motion(
             self,
@@ -1292,6 +1666,9 @@ impl Compositor {
 
     pub fn focus_window(&mut self, window: Option<&Window>, serial: smithay::utils::Serial) {
         let previous = self.wm.keyboard_focus();
+        let tab_switched = window
+            .and_then(|window| self.window_ids.get(window))
+            .is_some_and(|&id| !self.wm.is_window_visible(id));
         let monitor = match window {
             Some(window) => {
                 let Some(&id) = self.window_ids.get(window) else {
@@ -1314,11 +1691,62 @@ impl Compositor {
         debug_assert_eq!(self.wm.active_monitor(), Some(monitor));
         if previous != self.wm.keyboard_focus() {
             self.ipc_dirty = true;
-            self.sync_keyboard_focus(serial);
+            if tab_switched {
+                self.reconcile_monitor(monitor);
+            } else {
+                self.sync_keyboard_focus(serial);
+            }
         }
     }
 
-    fn sync_keyboard_focus(&mut self, serial: smithay::utils::Serial) {
+    pub(super) fn sync_keyboard_focus(&mut self, serial: smithay::utils::Serial) {
+        if self.is_locked() {
+            let focus = self.lock_screen.as_ref().and_then(|session| {
+                self.cursor_position
+                    .and_then(|pos| self.monitor_at(pos))
+                    .and_then(|monitor| {
+                        self.output_monitors
+                            .iter()
+                            .find_map(|(output, &id)| (id == monitor).then_some(output))
+                    })
+                    .and_then(|output| session.surfaces.get(output))
+                    .filter(|surface| surface.alive())
+                    .or_else(|| session.surfaces.values().find(|surface| surface.alive()))
+                    .map(|surface| surface.wl_surface().clone())
+            });
+            self.seat
+                .get_keyboard()
+                .expect("keyboard")
+                .set_focus(self, focus, serial);
+            return;
+        }
+        // Interactive top/overlay layer surfaces (such as a launcher) own
+        // keyboard input until they close. Keep the WM's remembered toplevel
+        // focus so it can be restored immediately afterwards.
+        let exclusive = self
+            .layers
+            .values()
+            .filter_map(|entry| {
+                use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
+                let layer = entry.layer.layer();
+                (entry.layer.cached_state().keyboard_interactivity
+                    == KeyboardInteractivity::Exclusive)
+                    .then(|| match layer {
+                        Layer::Overlay => Some((2, entry.layer.wl_surface().clone())),
+                        Layer::Top => Some((1, entry.layer.wl_surface().clone())),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, surface)| surface);
+        if let Some(surface) = exclusive {
+            let keyboard = self.seat.get_keyboard().expect("keyboard");
+            if keyboard.current_focus() != Some(surface.clone()) {
+                keyboard.set_focus(self, Some(surface), serial);
+            }
+            return;
+        }
         let focused_id = self.wm.keyboard_focus();
         let previous_id = self.activated_window;
         let focused = focused_id.and_then(|id| {
@@ -1399,6 +1827,9 @@ impl Compositor {
     }
 
     fn remove_registered_window(&mut self, window: &Window, id: WindowId) -> Option<MonitorId> {
+        if self.hovered_window.as_ref() == Some(window) {
+            self.hovered_window = None;
+        }
         if self
             .floating_drag
             .as_ref()
@@ -1418,7 +1849,17 @@ impl Compositor {
             .as_ref()
             .is_some_and(|drag| &drag.window == window)
         {
-            self.title_drag = None;
+            self.clear_title_drag();
+        } else if self
+            .title_drag
+            .as_ref()
+            .and_then(|drag| drag.target)
+            .is_some_and(|target| match target {
+                TitleDrop::Insert(root, ..) | TitleDrop::Group(root) => root == id,
+            })
+        {
+            self.title_drag.as_mut().expect("title drag").target = None;
+            self.needs_repaint = true;
         }
         self.window_ids.remove(window);
         self.id_windows.remove(&id);
@@ -1429,6 +1870,7 @@ impl Compositor {
             self.space.unmap_elem(&scene);
         }
         self.requested_geometry.remove(&id);
+        self.tile_geometry.remove(&id);
         self.mapped_windows.remove(&id);
         self.wm.remove_window(id).map(|owner| owner.monitor)
     }
@@ -1442,8 +1884,13 @@ impl Compositor {
         else {
             return;
         };
-        if let Some(rect) = self.requested_geometry.get(&id).copied() {
-            self.place_window(id, rect);
+        let selected = self
+            .wm
+            .tile_root(id)
+            .and_then(|root| self.wm.selected_tile(root))
+            .unwrap_or(id);
+        if let Some(rect) = self.requested_geometry.get(&selected).copied() {
+            self.place_window(selected, rect);
         }
     }
 }
@@ -1475,6 +1922,26 @@ mod tests {
     }
 
     #[test]
+    fn locked_session_hides_ipc_and_never_hit_tests_desktop_surfaces() {
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let mut compositor =
+            Compositor::new(&mut loop_, display, Keybindings::default(), "seat0").unwrap();
+        compositor.wm.add_monitor();
+        assert!(!compositor.ipc_snapshot().monitors.is_empty());
+        compositor.lock_screen = Some(LockSession {
+            confirmation: None,
+            surfaces: HashMap::new(),
+            covered: HashSet::new(),
+        });
+        assert_eq!(compositor.ipc_snapshot().monitors.len(), 0);
+        assert_eq!(compositor.ipc_snapshot().active_monitor, None);
+        assert!(compositor.surface_under((20.0, 20.0).into()).is_none());
+        compositor.lock_screen = None;
+        assert!(!compositor.ipc_snapshot().monitors.is_empty());
+    }
+
+    #[test]
     fn configured_tile_gaps_reach_the_compositor_layout() {
         let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
         let display = Display::<Compositor>::new().unwrap();
@@ -1485,6 +1952,248 @@ mod tests {
         assert_eq!(
             compositor.layout_settings.border,
             LayoutSettings::default().border
+        );
+    }
+
+    #[test]
+    fn tile_drop_target_uses_column_halves_and_stack_halves() {
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let mut compositor =
+            Compositor::new(&mut loop_, display, Keybindings::default(), "seat0").unwrap();
+        let output = smithay::output::Output::new(
+            "test".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "test".into(),
+                model: "virtual".into(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (300, 200).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        compositor.space.map_output(&output, (0, 0));
+        compositor.register_output(&output);
+        let monitor = compositor.monitor_for_output(&output).unwrap();
+        let ids: Vec<_> = (0..3)
+            .map(|index| {
+                let id = compositor
+                    .wm
+                    .add_window(WindowOwner {
+                        monitor,
+                        workspace: crate::wm::WorkspaceId::FIRST,
+                    })
+                    .unwrap();
+                compositor.tile_geometry.insert(
+                    id,
+                    Rect {
+                        x: index * 100,
+                        y: 0,
+                        width: 100,
+                        height: 200,
+                    },
+                );
+                id
+            })
+            .collect();
+        compositor
+            .apply_command(WmCommand::ToggleTilingMode { monitor })
+            .unwrap();
+        for (index, &id) in ids.iter().enumerate() {
+            compositor.tile_geometry.insert(
+                id,
+                Rect {
+                    x: index as i32 * 100,
+                    y: 0,
+                    width: 100,
+                    height: 200,
+                },
+            );
+        }
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (110.0, 80.0).into()),
+            Some((ids[1], false, DropEdge::Left))
+        );
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (190.0, 80.0).into()),
+            Some((ids[1], true, DropEdge::Right))
+        );
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (30.0, 80.0).into()),
+            None
+        );
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (320.0, 80.0).into()),
+            None
+        );
+        compositor
+            .apply_command(WmCommand::ToggleTilingMode { monitor })
+            .unwrap();
+        compositor.tile_geometry.insert(
+            ids[1],
+            Rect {
+                x: 100,
+                y: 0,
+                width: 200,
+                height: 100,
+            },
+        );
+        compositor.tile_geometry.insert(
+            ids[2],
+            Rect {
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 100,
+            },
+        );
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (150.0, 25.0).into()),
+            Some((ids[1], false, DropEdge::Top))
+        );
+        assert_eq!(
+            compositor.tile_drop_target(ids[0], (150.0, 75.0).into()),
+            Some((ids[1], true, DropEdge::Bottom))
+        );
+    }
+
+    #[test]
+    fn grouping_does_not_mark_the_hidden_tabs_full_tile_size_as_configured() {
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let mut compositor =
+            Compositor::new(&mut loop_, display, Keybindings::default(), "seat0").unwrap();
+        let output = smithay::output::Output::new(
+            "test".into(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "test".into(),
+                model: "virtual".into(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (400, 200).into(),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            Some((0, 0).into()),
+        );
+        compositor.space.map_output(&output, (0, 0));
+        compositor.register_output(&output);
+        let monitor = compositor.monitor_for_output(&output).unwrap();
+        let owner = WindowOwner {
+            monitor,
+            workspace: crate::wm::WorkspaceId::FIRST,
+        };
+        let a = compositor.wm.add_window(owner).unwrap();
+        let b = compositor.wm.add_window(owner).unwrap();
+        let old_frame = Rect {
+            x: 200,
+            y: 0,
+            width: 200,
+            height: 200,
+        };
+        compositor.requested_geometry.insert(b, old_frame);
+
+        compositor
+            .apply_command(WmCommand::GroupTile {
+                monitor,
+                window: a,
+                target: b,
+            })
+            .unwrap();
+        let slot = compositor.tile_geometry[&b];
+        assert!(slot.width > old_frame.width);
+        assert_eq!(compositor.requested_geometry[&b], old_frame);
+        compositor
+            .apply_command(WmCommand::CycleGroupTab { monitor })
+            .unwrap();
+        assert_eq!(compositor.wm.keyboard_focus(), Some(b));
+        assert_eq!(compositor.requested_geometry[&b], old_frame);
+        // On a registered client, place_window now sees the width change and
+        // sends the missing configure before drawing that tab.
+    }
+
+    #[test]
+    fn insertion_line_spans_the_slot_in_purple_without_covering_a_window() {
+        let area = Rect {
+            x: 0,
+            y: 24,
+            width: 300,
+            height: 176,
+        };
+        let column = Rect {
+            x: 108,
+            y: 32,
+            width: 84,
+            height: 160,
+        };
+        assert_eq!(
+            drop_indicator_rect(column, area, DropEdge::Left, 8),
+            Some(Rect {
+                x: 100,
+                y: 24,
+                width: 8,
+                height: 176
+            })
+        );
+        assert_eq!(
+            drop_indicator_rect(column, area, DropEdge::Right, 8),
+            Some(Rect {
+                x: 192,
+                y: 24,
+                width: 8,
+                height: 176
+            })
+        );
+        let stack = Rect {
+            x: 108,
+            y: 32,
+            width: 184,
+            height: 76,
+        };
+        assert_eq!(
+            drop_indicator_rect(stack, area, DropEdge::Bottom, 8),
+            Some(Rect {
+                x: 108,
+                y: 108,
+                width: 184,
+                height: 8
+            })
+        );
+        assert_eq!(
+            drop_indicator_rect(Rect { x: 0, ..column }, area, DropEdge::Left, 0)
+                .unwrap()
+                .x,
+            0
+        );
+        assert_eq!(
+            drop_indicator_rect(column, Rect { height: 0, ..area }, DropEdge::Top, 8),
+            None
+        );
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let keys = Keybindings::parse("[colors]\nfocused_border = '#1234ab'\n").unwrap();
+        let compositor = Compositor::new(&mut loop_, display, keys, "seat0").unwrap();
+        assert_eq!(
+            compositor.drop_indicator.color(),
+            [
+                0x12 as f32 / 255.0,
+                0x34 as f32 / 255.0,
+                0xab as f32 / 255.0,
+                1.0
+            ]
+            .into()
         );
     }
 
@@ -1529,7 +2238,7 @@ mod tests {
                 workspace: crate::wm::WorkspaceId::FIRST,
             })
             .unwrap();
-        compositor.requested_geometry.insert(
+        compositor.tile_geometry.insert(
             left,
             Rect {
                 x: 0,
@@ -1538,7 +2247,7 @@ mod tests {
                 height: 200,
             },
         );
-        compositor.requested_geometry.insert(
+        compositor.tile_geometry.insert(
             right,
             Rect {
                 x: 100,
@@ -1552,6 +2261,24 @@ mod tests {
         compositor
             .apply_command(WmCommand::ToggleTilingMode { monitor })
             .unwrap();
+        compositor.tile_geometry.insert(
+            left,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 200,
+            },
+        );
+        compositor.tile_geometry.insert(
+            right,
+            Rect {
+                x: 100,
+                y: 0,
+                width: 100,
+                height: 200,
+            },
+        );
         assert!(!compositor.begin_column_resize((100.0, 10.0).into()));
         assert!(!compositor.begin_column_resize((80.0, 50.0).into()));
         assert!(!compositor.column_resize_cursor_at((100.0, 10.0).into()));
@@ -1607,7 +2334,7 @@ mod tests {
                         workspace: crate::wm::WorkspaceId::FIRST,
                     })
                     .unwrap();
-                compositor.requested_geometry.insert(
+                compositor.tile_geometry.insert(
                     id,
                     Rect {
                         x: index * 100,
@@ -1623,6 +2350,17 @@ mod tests {
         compositor
             .apply_command(WmCommand::ToggleTilingMode { monitor })
             .unwrap();
+        for (index, &id) in windows.iter().enumerate() {
+            compositor.tile_geometry.insert(
+                id,
+                Rect {
+                    x: index as i32 * 100,
+                    y: 0,
+                    width: 100,
+                    height: 200,
+                },
+            );
+        }
         compositor
             .resize_focused_column(monitor, Direction::Previous)
             .unwrap();
@@ -1786,6 +2524,68 @@ mod tests {
         compositor.space.map_output(&hdmi, (0, 0));
         compositor.reattach_output(&hdmi, hdmi_id);
         assert_eq!(compositor.wm.active_monitor(), Some(hdmi_id));
+    }
+
+    #[test]
+    fn new_windows_use_the_output_under_the_pointer_without_a_prior_click() {
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let mut compositor =
+            Compositor::new(&mut loop_, display, Keybindings::default(), "seat0").unwrap();
+        let create = |name: &str, x| {
+            let output = smithay::output::Output::new(
+                name.into(),
+                smithay::output::PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: smithay::output::Subpixel::Unknown,
+                    make: "test".into(),
+                    model: "virtual".into(),
+                },
+            );
+            output.change_current_state(
+                Some(smithay::output::Mode {
+                    size: (800, 600).into(),
+                    refresh: 60_000,
+                }),
+                None,
+                None,
+                Some((x, 0).into()),
+            );
+            output
+        };
+        let hdmi = create("HDMI-A-2", 0);
+        let dp = create("DP-4", 800);
+        for (output, x) in [(&hdmi, 0), (&dp, 800)] {
+            compositor.space.map_output(output, (x, 0));
+            compositor.register_output(output);
+        }
+        let hdmi_id = compositor.monitor_for_output(&hdmi).unwrap();
+        let dp_id = compositor.monitor_for_output(&dp).unwrap();
+        let dp_workspace = crate::wm::WorkspaceId::new(2).unwrap();
+        compositor
+            .wm
+            .execute(WmCommand::SwitchWorkspace {
+                monitor: dp_id,
+                workspace: dp_workspace,
+            })
+            .unwrap();
+        compositor.wm.set_active_monitor(hdmi_id);
+        compositor.cursor_position = Some((900.0, 100.0).into());
+        assert_eq!(compositor.wm.active_monitor(), Some(hdmi_id));
+        assert_eq!(
+            compositor.owner_for_new_window(),
+            WindowOwner {
+                monitor: dp_id,
+                workspace: dp_workspace
+            }
+        );
+        assert_eq!(compositor.wm.active_monitor(), Some(dp_id));
+
+        compositor.wm.set_active_monitor(hdmi_id);
+        compositor.cursor_position = None;
+        assert_eq!(compositor.owner_for_new_window().monitor, hdmi_id);
+        compositor.cursor_position = Some((1700.0, 100.0).into());
+        assert_eq!(compositor.owner_for_new_window().monitor, hdmi_id);
     }
 
     #[test]

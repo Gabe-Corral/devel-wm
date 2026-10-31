@@ -149,8 +149,63 @@ fn needs_new_connector_scan(known: bool, pending: bool) -> bool {
 #[derive(Clone, Copy)]
 struct ProbeRequest {
     handle: connector::Handle,
-    force: bool,
+    kind: ProbeKind,
     epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeKind {
+    DiscoveryStatus,
+    DiscoveryMode,
+    VerifyHead { generation: u64, confirm: bool },
+}
+
+impl ProbeKind {
+    fn force(self) -> bool {
+        self != Self::DiscoveryStatus
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifyDecision {
+    RetryFresh,
+    ConfirmDisconnect,
+    Disconnect,
+    ConfirmReconnect,
+    Reconnect,
+    KeepOnline,
+}
+
+fn verify_decision(
+    generation: u64,
+    current_generation: u64,
+    online: bool,
+    confirm: bool,
+    state: connector::State,
+) -> VerifyDecision {
+    if generation != current_generation {
+        VerifyDecision::RetryFresh
+    } else {
+        match (online, state, confirm) {
+            (true, connector::State::Disconnected, true) => VerifyDecision::Disconnect,
+            (true, connector::State::Disconnected, false) => VerifyDecision::ConfirmDisconnect,
+            (false, connector::State::Connected, true) => VerifyDecision::Reconnect,
+            (false, connector::State::Connected, false) => VerifyDecision::ConfirmReconnect,
+            _ => VerifyDecision::KeepOnline,
+        }
+    }
+}
+
+fn verification_order<T: Copy>(heads: impl IntoIterator<Item = (T, bool)>) -> Vec<T> {
+    let heads: Vec<_> = heads.into_iter().collect();
+    // A known-offline connector is the likely source of a reconnect event.
+    // Process it before slow forced probes of unchanged online outputs.
+    heads
+        .iter()
+        .filter(|(_, online)| !online)
+        .chain(heads.iter().filter(|(_, online)| *online))
+        .map(|(handle, _)| *handle)
+        .collect()
 }
 
 struct ProbeReply {
@@ -185,7 +240,7 @@ impl DiscoveryWorker {
                         break;
                     }
                     let started = Instant::now();
-                    let result = card.get_connector(request.handle, request.force);
+                    let result = card.get_connector(request.handle, request.kind.force());
                     if replies
                         .send(ProbeReply {
                             request,
@@ -207,14 +262,19 @@ impl DiscoveryWorker {
         })
     }
 
-    fn request(&mut self, handle: connector::Handle, force: bool, epoch: u64) -> io::Result<()> {
+    fn request(
+        &mut self,
+        handle: connector::Handle,
+        kind: ProbeKind,
+        epoch: u64,
+    ) -> io::Result<()> {
         if !self.pending.insert(handle) {
             return Ok(());
         }
         if self.requests.as_ref().is_some_and(|tx| {
             tx.send(ProbeRequest {
                 handle,
-                force,
+                kind,
                 epoch,
             })
             .is_ok()
@@ -275,6 +335,8 @@ struct NativeHead {
     missing_checks: u8,
     tracker: OutputDamageTracker,
     queued: bool,
+    queued_at: Option<Instant>,
+    queued_lock_frame: bool,
     first_presented: bool,
     repaint_after_flip: bool,
 }
@@ -291,6 +353,7 @@ pub struct NativeOutput {
     pending_new: Vec<(connector::Handle, u8)>,
     discovery: Option<DiscoveryWorker>,
     discovery_epoch: u64,
+    hotplug_generation: u64,
     discovery_rescan: bool,
     renderer: Option<GlesRenderer>,
     drm: Option<ManagedDrm>,
@@ -311,6 +374,46 @@ pub struct NativeOutput {
 impl NativeOutput {
     fn has_queued(&self) -> bool {
         self.heads.iter().any(|head| head.queued)
+    }
+
+    fn verify_heads_after_change(&mut self) -> io::Result<()> {
+        // The non-forced udev status query can retain a stale Connected value
+        // for DP-4. Probe existing heads on the read-only worker rather than
+        // blocking libinput with an online forced EDID query.
+        self.hotplug_generation = self.hotplug_generation.wrapping_add(1);
+        let Some(worker) = self.discovery.as_mut() else {
+            return Ok(());
+        };
+        for handle in
+            verification_order(self.heads.iter().map(|head| (head.connector, head.online)))
+        {
+            worker.request(
+                handle,
+                ProbeKind::VerifyHead {
+                    generation: self.hotplug_generation,
+                    confirm: false,
+                },
+                self.discovery_epoch,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_offline_heads(&mut self) -> io::Result<()> {
+        let Some(worker) = self.discovery.as_mut() else {
+            return Ok(());
+        };
+        for head in self.heads.iter().filter(|head| !head.online) {
+            worker.request(
+                head.connector,
+                ProbeKind::VerifyHead {
+                    generation: self.hotplug_generation,
+                    confirm: false,
+                },
+                self.discovery_epoch,
+            )?;
+        }
+        Ok(())
     }
 
     fn receive_discovery(&mut self, compositor: &mut Compositor) -> Result<()> {
@@ -348,56 +451,136 @@ impl NativeOutput {
                 self.discovery_rescan = true;
                 continue;
             }
-            let info = result?;
-            let name = presentation::connector_name(&info);
-            eprintln!(
-                "Native background {} query for {name}: {elapsed:?}",
-                if request.force { "mode" } else { "status" }
-            );
-            if request.force {
-                let Some(index) = self
-                    .pending_new
-                    .iter()
-                    .position(|(handle, _)| *handle == request.handle)
-                else {
-                    continue;
-                };
-                let (_, attempts) = self.pending_new.remove(index);
-                if info.state() == connector::State::Connected {
-                    if info.modes().is_empty() {
-                        if attempts < 4 {
-                            self.pending_new.push((request.handle, attempts + 1));
-                        } else {
-                            eprintln!(
-                                "Native output {name} still has no modes; waiting for another udev change"
-                            );
-                        }
+            let ProbeKind::VerifyHead {
+                generation,
+                confirm,
+            } = request.kind
+            else {
+                let info = result?;
+                let name = presentation::connector_name(&info);
+                eprintln!(
+                    "Native background {} query for {name}: {elapsed:?}",
+                    if request.kind.force() {
+                        "mode"
                     } else {
-                        let started = Instant::now();
-                        self.add_discovered_head(&info, compositor)?;
-                        if started.elapsed() >= Duration::from_millis(20) {
-                            eprintln!(
-                                "Native newly connected {name} takeover blocked the input loop for {:?}",
-                                started.elapsed()
-                            );
+                        "status"
+                    }
+                );
+                if request.kind == ProbeKind::DiscoveryMode {
+                    let Some(index) = self
+                        .pending_new
+                        .iter()
+                        .position(|(handle, _)| *handle == request.handle)
+                    else {
+                        continue;
+                    };
+                    let (_, attempts) = self.pending_new.remove(index);
+                    if info.state() == connector::State::Connected {
+                        if info.modes().is_empty() {
+                            if attempts < 4 {
+                                self.pending_new.push((request.handle, attempts + 1));
+                            } else {
+                                eprintln!(
+                                    "Native output {name} still has no modes; waiting for another udev change"
+                                );
+                            }
+                        } else {
+                            let started = Instant::now();
+                            self.add_discovered_head(&info, compositor)?;
+                            if started.elapsed() >= Duration::from_millis(20) {
+                                eprintln!(
+                                    "Native newly connected {name} takeover blocked the input loop for {:?}",
+                                    started.elapsed()
+                                );
+                            }
                         }
                     }
+                } else if info.state() == connector::State::Connected
+                    && !self
+                        .heads
+                        .iter()
+                        .any(|head| head.connector == request.handle)
+                    && !self
+                        .pending_new
+                        .iter()
+                        .any(|(handle, _)| *handle == request.handle)
+                {
+                    println!(
+                        "Native output {name} connected; waiting for a stable mode before takeover"
+                    );
+                    self.pending_new.push((request.handle, 0));
+                    self.last_connector_check = Instant::now();
                 }
-            } else if info.state() == connector::State::Connected
-                && !self
-                    .heads
-                    .iter()
-                    .any(|head| head.connector == request.handle)
-                && !self
-                    .pending_new
-                    .iter()
-                    .any(|(handle, _)| *handle == request.handle)
-            {
-                println!(
-                    "Native output {name} connected; waiting for a stable mode before takeover"
-                );
-                self.pending_new.push((request.handle, 0));
-                self.last_connector_check = Instant::now();
+                continue;
+            };
+            let Some(index) = self
+                .heads
+                .iter()
+                .position(|head| head.connector == request.handle)
+            else {
+                continue;
+            };
+            // If another udev event arrived while this ioctl was in flight,
+            // sample again rather than acting on a result from the old event.
+            if generation != self.hotplug_generation {
+                self.discovery.as_mut().expect("discovery worker").request(
+                    request.handle,
+                    ProbeKind::VerifyHead {
+                        generation: self.hotplug_generation,
+                        confirm: false,
+                    },
+                    self.discovery_epoch,
+                )?;
+                continue;
+            }
+            let info = match result {
+                Ok(info) => info,
+                Err(err) => {
+                    eprintln!(
+                        "Native background forced status query for {} failed: {err}",
+                        self.heads[index].output.name()
+                    );
+                    continue;
+                }
+            };
+            let name = presentation::connector_name(&info);
+            eprintln!(
+                "Native background forced status query for {name}: {:?} ({elapsed:?}, confirmation: {confirm})",
+                info.state()
+            );
+            match verify_decision(
+                generation,
+                self.hotplug_generation,
+                self.heads[index].online,
+                confirm,
+                info.state(),
+            ) {
+                VerifyDecision::ConfirmDisconnect | VerifyDecision::ConfirmReconnect => {
+                    self.discovery.as_mut().expect("discovery worker").request(
+                        request.handle,
+                        ProbeKind::VerifyHead {
+                            generation,
+                            confirm: true,
+                        },
+                        self.discovery_epoch,
+                    )?;
+                }
+                VerifyDecision::Disconnect => self.detach_head(index, compositor),
+                VerifyDecision::Reconnect => {
+                    if info.modes().contains(&self.heads[index].mode) {
+                        let started = Instant::now();
+                        self.reconnect_head(index, &info, compositor)?;
+                        eprintln!(
+                            "Native {name} reconnect main-thread setup: {:?}",
+                            started.elapsed()
+                        );
+                    } else {
+                        eprintln!(
+                            "Native {name} has no configured startup mode yet; waiting for another status check"
+                        );
+                    }
+                }
+                VerifyDecision::RetryFresh | VerifyDecision::KeepOnline => {}
             }
         }
         Ok(())
@@ -524,6 +707,8 @@ impl NativeOutput {
             missing_checks: 0,
             tracker,
             queued: false,
+            queued_at: None,
+            queued_lock_frame: false,
             first_presented: false,
             repaint_after_flip: false,
         });
@@ -535,9 +720,13 @@ impl NativeOutput {
         Ok(true)
     }
 
-    fn reprobe_connectors(&mut self, compositor: &mut Compositor, urgent: bool) -> Result<bool> {
-        if (!self.auto && self.heads.len() < 2)
-            || self.paused
+    fn reprobe_connectors(
+        &mut self,
+        compositor: &mut Compositor,
+        urgent: bool,
+        allow_forced: bool,
+    ) -> Result<bool> {
+        if self.paused
             || !self.session.is_active()
             || (!urgent
                 && !self.heads.iter().any(|head| !head.online)
@@ -552,12 +741,15 @@ impl NativeOutput {
         let settling = !self.pending_new.is_empty();
         self.last_connector_check = Instant::now();
         let mut changed = false;
-        for index in 0..self.heads.len() {
+        if !allow_forced && !urgent {
+            self.verify_offline_heads()?;
+        }
+        // Even get_connector(force=false) can block libinput (238 ms on DP-4
+        // reconnect). Normal udev and periodic paths only schedule the worker;
+        // synchronous probes remain for exceptional DRM-error recovery.
+        let heads_to_probe = if allow_forced { self.heads.len() } else { 0 };
+        for index in 0..heads_to_probe {
             let handle = self.heads[index].connector;
-            // A card-wide udev change may concern another connector. Forcing
-            // an EDID probe on every live head stalled input for 143–302 ms
-            // when DP-4 was plugged in. The non-forced query still reports
-            // connection state; only offline heads need refreshed modes.
             let mut force = !self.heads[index].online;
             let started = Instant::now();
             let mut probe = self
@@ -594,6 +786,15 @@ impl NativeOutput {
                     continue;
                 }
             };
+            if urgent {
+                eprintln!(
+                    "Native connector {} after udev/recovery: {:?} (forced: {}, online: {})",
+                    self.heads[index].output.name(),
+                    info.state(),
+                    force,
+                    self.heads[index].online,
+                );
+            }
             let (checks, transition) = connector_transition(
                 self.heads[index].online,
                 info.state(),
@@ -639,14 +840,14 @@ impl NativeOutput {
                 self.discovery
                     .as_mut()
                     .expect("automatic discovery worker")
-                    .request(handle, false, self.discovery_epoch)?;
+                    .request(handle, ProbeKind::DiscoveryStatus, self.discovery_epoch)?;
             }
         } else if self.auto {
             for &(handle, _) in &self.pending_new {
                 self.discovery
                     .as_mut()
                     .expect("automatic discovery worker")
-                    .request(handle, true, self.discovery_epoch)?;
+                    .request(handle, ProbeKind::DiscoveryMode, self.discovery_epoch)?;
             }
         }
         let new_outputs = started.elapsed().saturating_sub(existing_heads);
@@ -693,6 +894,8 @@ impl NativeOutput {
         // connectors' snapshots remain owned by ManagedDrm.
         head.surface.take();
         head.queued = false;
+        head.queued_at = None;
+        head.queued_lock_frame = false;
         head.repaint_after_flip = false;
         head.online = false;
         head.missing_checks = 0;
@@ -831,7 +1034,15 @@ impl NativeOutput {
 
     fn flush_motion(&mut self, compositor: &mut Compositor) {
         if let Some(motion) = self.pending_motion.take() {
+            let started = compositor.perf.as_ref().map(|_| Instant::now());
             compositor.process_relative_motion(motion.delta, motion.time);
+            if let Some(started) = started {
+                compositor
+                    .perf
+                    .as_mut()
+                    .expect("performance enabled")
+                    .motion_flush(started.elapsed());
+            }
         }
     }
 
@@ -850,7 +1061,7 @@ impl NativeOutput {
             let (mut buffer, age) = surface.next_buffer()?;
             let result = {
                 let mut framebuffer = renderer.bind(&mut buffer)?;
-                let cursor = compositor
+                let mut cursor = compositor
                     .cursor_position
                     .and_then(|global| {
                         compositor
@@ -869,17 +1080,47 @@ impl NativeOutput {
                             .elements(renderer, local.to_physical(scale), scale, icon)
                     })
                     .unwrap_or_default();
-                smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
-                    &head.output,
-                    renderer,
-                    &mut framebuffer,
-                    1.0,
-                    age as usize,
-                    [&compositor.space],
-                    &cursor,
-                    &mut head.tracker,
-                    [0.1, 0.1, 0.1, 1.0],
-                )?
+                if let Some(line) = compositor.drop_indicator_element(&head.output) {
+                    cursor.push(CursorElements::Indicator(line));
+                }
+                if compositor.is_locked() {
+                    use smithay::backend::renderer::element::{
+                        Kind,
+                        surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                    };
+                    let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = compositor
+                        .lock_surface_for_output(&head.output)
+                        .map(|surface| {
+                            render_elements_from_surface_tree(
+                                renderer,
+                                surface.wl_surface(),
+                                (0, 0),
+                                head.output.current_scale().fractional_scale(),
+                                1.0,
+                                Kind::Unspecified,
+                            )
+                        })
+                        .unwrap_or_default();
+                    head.tracker.render_output(
+                        renderer,
+                        &mut framebuffer,
+                        0,
+                        &elements,
+                        [0.0, 0.0, 0.0, 1.0],
+                    )?
+                } else {
+                    smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
+                        &head.output,
+                        renderer,
+                        &mut framebuffer,
+                        1.0,
+                        age as usize,
+                        [&compositor.space],
+                        &cursor,
+                        &mut head.tracker,
+                        [0.1, 0.1, 0.1, 1.0],
+                    )?
+                }
             };
             let rendered = started.map(|_| Instant::now());
             let damage = result.damage.cloned();
@@ -887,7 +1128,12 @@ impl NativeOutput {
                 let damage = damage.clone();
                 surface.queue_buffer(Some(result.sync), Some(damage), ())?;
                 head.queued = true;
+                head.queued_at = compositor.perf.as_ref().map(|_| Instant::now());
+                head.queued_lock_frame = compositor.is_locked();
             } else {
+                if compositor.is_locked() {
+                    compositor.lock_frame_presented(&head.output);
+                }
                 compositor.flush_resize_configure();
                 Self::send_frames(&head.output, compositor);
             }
@@ -925,6 +1171,9 @@ impl NativeOutput {
         {
             return Ok(());
         }
+        // Capture callback arrival before flushing coalesced input or calling
+        // Smithay's completion handler, so those costs are measured separately.
+        let callback_at = compositor.perf.as_ref().map(|_| Instant::now());
         self.flush_motion(compositor);
         let head = self
             .heads
@@ -936,6 +1185,17 @@ impl NativeOutput {
             .expect("native surface")
             .frame_submitted()?;
         head.queued = false;
+        if let (Some(queued_at), Some(callback_at)) = (head.queued_at.take(), callback_at) {
+            compositor
+                .perf
+                .as_mut()
+                .expect("performance enabled")
+                .frame_completed(&head.output.name(), callback_at.duration_since(queued_at));
+        }
+        if head.queued_lock_frame && compositor.is_locked() {
+            compositor.lock_frame_presented(&head.output);
+        }
+        head.queued_lock_frame = false;
         if !head.first_presented {
             head.first_presented = true;
             println!(
@@ -956,6 +1216,18 @@ impl NativeOutput {
     }
 
     fn send_frames(output: &Output, compositor: &mut Compositor) {
+        if compositor.is_locked() {
+            if let Some(surface) = compositor.lock_surface_for_output(output) {
+                smithay::desktop::utils::send_frames_surface_tree(
+                    surface.wl_surface(),
+                    output,
+                    compositor.start_time.elapsed(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            }
+            return;
+        }
         for window in compositor.space.elements() {
             if !compositor
                 .space
@@ -1007,6 +1279,8 @@ impl NativeOutput {
         for head in &mut self.heads {
             head.surface.take();
             head.queued = false;
+            head.queued_at = None;
+            head.queued_lock_frame = false;
             head.repaint_after_flip = false;
         }
         self.pending_motion = None;
@@ -1337,7 +1611,9 @@ fn initialize_device(
     libinput
         .udev_assign_seat(&session.seat())
         .map_err(|()| io::Error::other("libinput could not attach to the native seat"))?;
-    let discovery = auto.then(|| DiscoveryWorker::new(&fd)).transpose()?;
+    // The worker also verifies already-online heads after udev, even in
+    // explicitly named sessions. Keep forced DRM queries off the input loop.
+    let discovery = Some(DiscoveryWorker::new(&fd)?);
     let vt = GraphicsVt::enter()?;
     let mut heads = Vec::new();
     let mut origin_x: i32 = 0;
@@ -1432,6 +1708,8 @@ fn initialize_device(
             missing_checks: 0,
             tracker,
             queued: false,
+            queued_at: None,
+            queued_lock_frame: false,
             first_presented: false,
             repaint_after_flip: false,
         });
@@ -1449,7 +1727,7 @@ fn initialize_device(
                         && let Err(err) = native.frame_submitted(&mut data.compositor, flipped)
                     {
                         eprintln!("Native frame completion failed: {err}");
-                        match native.reprobe_connectors(&mut data.compositor, true) {
+                        match native.reprobe_connectors(&mut data.compositor, true, true) {
                             Ok(true) => println!("Native frame error followed a connector disconnect; survivor remains active"),
                             Ok(false) => {
                                 native.failure = Some(err.to_string());
@@ -1475,7 +1753,7 @@ fn initialize_device(
                     }
                     eprintln!("Native DRM error: {err}");
                     if let Some(native) = data.native.as_mut() {
-                        match native.reprobe_connectors(&mut data.compositor, true) {
+                        match native.reprobe_connectors(&mut data.compositor, true, true) {
                             Ok(true) => return,
                             Ok(false) => native.failure = Some(err.to_string()),
                             Err(reprobe) => native.failure = Some(format!("{err}; hotplug recovery failed: {reprobe}")),
@@ -1515,6 +1793,7 @@ fn initialize_device(
                 native.flush_motion(&mut data.compositor);
             }
             if let InputEvent::Keyboard { event, .. } = &event
+                && !data.compositor.is_locked()
                 && event.state() == KeyState::Pressed
                 && event.key_code() == smithay::input::keyboard::xkb::Keycode::new(22)
                 && data.compositor.seat.get_keyboard().is_some_and(|keyboard| {
@@ -1550,7 +1829,9 @@ fn initialize_device(
                 UdevEvent::Changed { device_id: changed } if changed == device_id => {
                     if let Some(native) = data.native.as_mut() {
                         let started = Instant::now();
-                        let result = native.reprobe_connectors(&mut data.compositor, true);
+                        let result = native
+                            .reprobe_connectors(&mut data.compositor, true, false)
+                            .and_then(|_| native.verify_heads_after_change().map_err(Into::into));
                         eprintln!("Native udev change callback: {:?}", started.elapsed());
                         if let Err(err) = result {
                             native.failure = Some(format!("native hotplug recovery failed: {err}"));
@@ -1586,6 +1867,7 @@ fn initialize_device(
         pending_new: Vec::new(),
         discovery,
         discovery_epoch: 0,
+        hotplug_generation: 0,
         discovery_rescan: false,
         renderer: Some(renderer),
         drm: Some(drm),
@@ -1701,7 +1983,7 @@ fn run_native_session(connectors: &[&str], keys: Keybindings) -> Result<()> {
                 .receive_discovery(&mut data.compositor)
                 .and_then(|()| {
                     native
-                        .reprobe_connectors(&mut data.compositor, false)
+                        .reprobe_connectors(&mut data.compositor, false, false)
                         .map(|_| ())
                 })
         {
@@ -1716,7 +1998,7 @@ fn run_native_session(connectors: &[&str], keys: Keybindings) -> Result<()> {
             || last_cleanup.elapsed() > Duration::from_secs(5)
         {
             data.compositor.cleanup_windows();
-            data.compositor.reap_terminal_children();
+            data.compositor.reap_launched_children();
             last_cleanup = Instant::now();
         }
         if let Some(snapshot) = data.compositor.take_ipc_update()
@@ -1742,7 +2024,7 @@ fn run_native_session(connectors: &[&str], keys: Keybindings) -> Result<()> {
             if let Some(native) = data.native.as_mut()
                 && let Err(err) = native.repaint(&mut data.compositor)
             {
-                match native.reprobe_connectors(&mut data.compositor, true) {
+                match native.reprobe_connectors(&mut data.compositor, true, true) {
                     Ok(true) => println!(
                         "Native repaint error followed a connector disconnect; repainting survivor"
                     ),
@@ -1827,7 +2109,9 @@ mod tests {
         let fd = DeviceFd::from(std::os::fd::OwnedFd::from(file));
         let mut worker = DiscoveryWorker::new(&fd).unwrap();
         let handle = connector::Handle::from(std::num::NonZeroU32::new(1).unwrap());
-        worker.request(handle, false, 7).unwrap();
+        worker
+            .request(handle, ProbeKind::DiscoveryStatus, 7)
+            .unwrap();
         let reply = worker.replies.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(reply.request.handle, handle);
         assert_eq!(reply.request.epoch, 7);
@@ -1835,6 +2119,60 @@ mod tests {
         worker.stop().unwrap();
         let owned: std::result::Result<std::os::fd::OwnedFd, _> = fd.try_into();
         assert!(owned.is_ok());
+    }
+
+    #[test]
+    fn background_verification_requires_two_current_forced_transition_reports() {
+        use connector::State::{Connected, Disconnected, Unknown};
+        assert!(!ProbeKind::DiscoveryStatus.force());
+        assert!(ProbeKind::DiscoveryMode.force());
+        assert!(
+            ProbeKind::VerifyHead {
+                generation: 1,
+                confirm: false
+            }
+            .force()
+        );
+        assert_eq!(
+            verify_decision(1, 2, true, true, Disconnected),
+            VerifyDecision::RetryFresh
+        );
+        assert_eq!(
+            verify_decision(2, 2, true, false, Connected),
+            VerifyDecision::KeepOnline
+        );
+        assert_eq!(
+            verify_decision(2, 2, true, true, Unknown),
+            VerifyDecision::KeepOnline
+        );
+        assert_eq!(
+            verify_decision(2, 2, true, false, Disconnected),
+            VerifyDecision::ConfirmDisconnect
+        );
+        assert_eq!(
+            verify_decision(2, 2, true, true, Disconnected),
+            VerifyDecision::Disconnect
+        );
+        assert_eq!(
+            verify_decision(2, 2, false, false, Connected),
+            VerifyDecision::ConfirmReconnect
+        );
+        assert_eq!(
+            verify_decision(2, 2, false, true, Connected),
+            VerifyDecision::Reconnect
+        );
+        assert_eq!(
+            verify_decision(2, 2, false, true, Disconnected),
+            VerifyDecision::KeepOnline
+        );
+    }
+
+    #[test]
+    fn reconnect_verification_checks_offline_heads_before_online_heads() {
+        assert_eq!(
+            verification_order([(1, true), (2, false), (3, true), (4, false)]),
+            [2, 4, 1, 3]
+        );
     }
 
     #[test]

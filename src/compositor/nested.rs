@@ -62,7 +62,7 @@ impl NestedOutput {
         let age = 0;
         let damage = {
             let (renderer, mut framebuffer) = self.backend.bind()?;
-            let cursor = state
+            let mut cursor = state
                 .cursor_position
                 .map(|position| {
                     let icon = state
@@ -73,17 +73,47 @@ impl NestedOutput {
                         .elements(renderer, position.to_physical(1.0), 1.0, icon)
                 })
                 .unwrap_or_default();
-            smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
-                &self.output,
-                renderer,
-                &mut framebuffer,
-                1.0,
-                age,
-                [&state.space],
-                &cursor,
-                &mut self.damage_tracker,
-                [0.1, 0.1, 0.1, 1.0],
-            )
+            if let Some(line) = state.drop_indicator_element(&self.output) {
+                cursor.push(CursorElements::Indicator(line));
+            }
+            if state.is_locked() {
+                use smithay::backend::renderer::element::{
+                    Kind,
+                    surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                };
+                let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+                    .lock_surface_for_output(&self.output)
+                    .map(|surface| {
+                        render_elements_from_surface_tree(
+                            renderer,
+                            surface.wl_surface(),
+                            (0, 0),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        )
+                    })
+                    .unwrap_or_default();
+                self.damage_tracker.render_output(
+                    renderer,
+                    &mut framebuffer,
+                    0,
+                    &elements,
+                    [0.0, 0.0, 0.0, 1.0],
+                )
+            } else {
+                smithay::desktop::space::render_output::<_, CursorElements<GlesRenderer>, _, _>(
+                    &self.output,
+                    renderer,
+                    &mut framebuffer,
+                    1.0,
+                    age,
+                    [&state.space],
+                    &cursor,
+                    &mut self.damage_tracker,
+                    [0.1, 0.1, 0.1, 1.0],
+                )
+            }
             .map_err(|err| SwapBuffersError::TemporaryFailure(Box::new(err)))?
             .damage
             .cloned()
@@ -94,6 +124,9 @@ impl NestedOutput {
         tracing::debug!(damaged = damage.is_some(), "nested repaint");
         if let Some(ref damage) = damage {
             self.backend.submit(Some(damage))?;
+        }
+        if state.is_locked() {
+            state.lock_frame_presented(&self.output);
         }
         if let Some(start) = start {
             let pixels = damage
@@ -117,6 +150,18 @@ impl NestedOutput {
                 output,
                 damage.is_some(),
             );
+        }
+        if state.is_locked() {
+            if let Some(surface) = state.lock_surface_for_output(&self.output) {
+                smithay::desktop::utils::send_frames_surface_tree(
+                    surface.wl_surface(),
+                    &self.output,
+                    state.start_time.elapsed(),
+                    Some(Duration::ZERO),
+                    |_, _| Some(self.output.clone()),
+                );
+            }
+            return Ok(());
         }
         for window in state.space.elements() {
             window.window.send_frame(
@@ -217,7 +262,17 @@ pub fn run_nested(
             let nested = data.nested.as_mut().expect("nested backend");
             match event {
                 WinitEvent::Resized { size, .. } => nested.resized(state, size),
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    let started = state.perf.as_ref().map(|_| Instant::now());
+                    state.process_input_event(event);
+                    if let Some(started) = started {
+                        state
+                            .perf
+                            .as_mut()
+                            .expect("performance enabled")
+                            .input(started.elapsed());
+                    }
+                }
                 WinitEvent::CloseRequested => state.loop_signal.stop(),
                 WinitEvent::Redraw => {
                     if let Err(err) = nested.repaint(state) {
