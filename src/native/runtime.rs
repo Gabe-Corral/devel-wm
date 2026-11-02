@@ -56,7 +56,7 @@ use crate::{
     LoopData,
     compositor::{Compositor, cursor::CursorElements},
     config::{Keybindings, OutputMode},
-    ipc::IpcServer,
+    ipc::{ControlServer, IpcServer},
     wm::MonitorId,
 };
 
@@ -1946,6 +1946,18 @@ fn run_native_session(connectors: &[&str], keys: Keybindings) -> Result<()> {
     initialize(&mut event_loop, &mut data, session, connectors, output_keys)?;
     let ipc = IpcServer::start(&data.compositor.ipc_snapshot())?;
     println!("DEVEL_WM_IPC={}", ipc.path().display());
+    let (control, requests) = ControlServer::start(&ipc)?;
+    event_loop
+        .handle()
+        .insert_source(requests, |event, _, data| {
+            if let smithay::reexports::calloop::channel::Event::Msg(request) = event
+                && !data.native.as_ref().is_some_and(|native| native.paused)
+            {
+                data.compositor
+                    .switch_workspace_from_control(&request.output, request.workspace);
+            }
+        })?;
+    println!("DEVEL_WM_CONTROL={}", control.path().display());
     data.ipc = Some(ipc);
     let socket = data.compositor.socket_name.clone();
     println!("WAYLAND_DISPLAY={}", socket.to_string_lossy());

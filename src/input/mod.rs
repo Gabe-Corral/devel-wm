@@ -401,6 +401,9 @@ impl Compositor {
                             Some(WmCommand::AdjustMasterRatio { monitor, direction })
                         }
                         Action::ToggleTilingMode => Some(WmCommand::ToggleTilingMode { monitor }),
+                        Action::ToggleFloatingMode => {
+                            Some(WmCommand::ToggleFloatingMode { monitor })
+                        }
                         Action::GroupFocusedWithNext => {
                             Some(WmCommand::GroupFocusedWithNext { monitor })
                         }
@@ -573,6 +576,7 @@ impl Compositor {
                             window
                         };
                         self.focus_window(Some(&window), serial);
+                        self.raise_floating_on_click(&window);
                         let left = event.button() == Some(MouseButton::Left);
                         let alt_drag = left && alt && self.begin_floating_drag(&window, location);
                         let alt_resize = event.button() == Some(MouseButton::Right)

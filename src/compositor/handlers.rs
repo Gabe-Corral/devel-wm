@@ -482,7 +482,13 @@ impl SeatHandler for Compositor {
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // A client may change the hotspot without changing the surface handle.
         tracing::debug!(?image, "cursor image requested");
-        self.cursor.image = image;
+        // Client-provided cursor surfaces can use a different theme/size than
+        // the compositor's cursor (e.g. Firefox's volume control). Keep the
+        // compositor theme instead of drawing that surface directly.
+        self.cursor.image = match image {
+            CursorImageStatus::Surface(_) => CursorImageStatus::default_named(),
+            other => other,
+        };
         self.needs_repaint = true;
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {

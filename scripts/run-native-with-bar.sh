@@ -117,16 +117,20 @@ exec {vt_fd}<&-
 
 wayland_display=
 ipc_socket=
+control_socket=
 deadline=$((SECONDS + 15))
 while ((SECONDS < deadline)); do
     display_line=$(grep -m1 '^WAYLAND_DISPLAY=' "$log" || true)
     ipc_line=$(grep -m1 '^DEVEL_WM_IPC=' "$log" || true)
-    if [[ -n $display_line && -n $ipc_line ]]; then
+    control_line=$(grep -m1 '^DEVEL_WM_CONTROL=' "$log" || true)
+    if [[ -n $display_line && -n $ipc_line && -n $control_line ]]; then
         wayland_display=${display_line#WAYLAND_DISPLAY=}
         ipc_socket=${ipc_line#DEVEL_WM_IPC=}
+        control_socket=${control_line#DEVEL_WM_CONTROL=}
         if [[ $wayland_display =~ ^wayland-[0-9]+$ \
               && $ipc_socket == "$XDG_RUNTIME_DIR/devel-wm/"* \
-              && -S $XDG_RUNTIME_DIR/$wayland_display && -S $ipc_socket ]]; then
+              && $control_socket == "$XDG_RUNTIME_DIR/devel-wm/"* \
+              && -S $XDG_RUNTIME_DIR/$wayland_display && -S $ipc_socket && -S $control_socket ]]; then
             break
         fi
     fi
@@ -140,14 +144,16 @@ while ((SECONDS < deadline)); do
     sleep 0.1
 done
 if [[ ! $wayland_display =~ ^wayland-[0-9]+$ \
-      || $ipc_socket != "$XDG_RUNTIME_DIR/devel-wm/"* \
-      || ! -S $XDG_RUNTIME_DIR/$wayland_display || ! -S $ipc_socket ]]; then
-    echo 'Timed out waiting for native Wayland and IPC sockets' >&2
+       || $ipc_socket != "$XDG_RUNTIME_DIR/devel-wm/"* \
+       || $control_socket != "$XDG_RUNTIME_DIR/devel-wm/"* \
+       || ! -S $XDG_RUNTIME_DIR/$wayland_display || ! -S $ipc_socket || ! -S $control_socket ]]; then
+    echo 'Timed out waiting for native Wayland, IPC and control sockets' >&2
     exit 1
 fi
 
 env -u DISPLAY -u WAYLAND_SOCKET WAYLAND_DISPLAY="$wayland_display" \
-    DEVEL_WM_IPC="$ipc_socket" "$root/../devel-bar/target/debug/devel-bar" &
+    DEVEL_WM_IPC="$ipc_socket" DEVEL_WM_CONTROL="$control_socket" \
+    "$root/../devel-bar/target/debug/devel-bar" &
 bar_pid=$!
 echo "devel-bar started on $wayland_display (one surface per named output; IPC: $ipc_socket)"
 if [[ $perf_sample == true ]]; then

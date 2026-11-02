@@ -30,3 +30,5 @@ scale = 1
 ```
 
 `[keybindings]` replaces individual named shortcuts while keeping the other defaults; conflicting or invalid bindings stop startup. `[terminal].command` is a program-and-arguments array, not a shell string. Gaps are nonnegative logical pixels. Color values are six-digit RGB hex strings; the font family is optional and size must be 8–20. `[outputs.CONNECTOR]` applies to native sessions only: choose an advertised `WIDTHxHEIGHT@HZ` mode and an integer scale from 1 to 4. Unspecified outputs use their preferred mode and scale 1.
+
+`Alt+Shift+t` (`toggle-floating-mode`) enters or leaves workspace-local floating mode, restoring the previous tiled layout when leaving. `Alt+t` (`toggle-tiling-mode`) still switches master/stack and side-by-side. Entering floating mode arranges existing tiles in the usable area without changing their tile order; their adjusted floating positions are remembered when returning. Individually floating windows remain floating in every mode. Drag a floating-mode window by its titlebar or Alt+left-button, resize with Alt+right-button. Edge snapping is not implemented yet.

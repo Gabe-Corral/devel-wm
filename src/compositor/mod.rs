@@ -88,9 +88,22 @@ struct FloatingResize {
 
 struct ColumnResize {
     monitor: MonitorId,
-    left: WindowId,
-    right: WindowId,
+    workspace: crate::wm::WorkspaceId,
+    kind: DividerResize,
     last_x: f64,
+}
+
+#[derive(Clone, Copy)]
+enum DividerResize {
+    Columns {
+        left: WindowId,
+        right: WindowId,
+    },
+    MasterStack {
+        start_ratio: u16,
+        start_x: f64,
+        shared_width: i32,
+    },
 }
 
 struct TitleDrag {
@@ -743,7 +756,8 @@ impl Compositor {
         let tiled = self
             .wm
             .tiled_windows(monitor, active)
-            .expect("active workspace");
+            .expect("active workspace")
+            .to_vec();
         let origin = self
             .space
             .output_geometry(output)
@@ -771,9 +785,31 @@ impl Compositor {
             .column_weights(monitor, active)
             .expect("active workspace");
         let placements = match mode {
-            TilingMode::MasterStack => layout::master_stack(usable, tiled, settings),
+            TilingMode::MasterStack => layout::master_stack(usable, &tiled, settings),
             TilingMode::SideBySide => {
-                layout::side_by_side_weighted(usable, tiled, &weights, settings)
+                layout::side_by_side_weighted(usable, &tiled, &weights, settings)
+            }
+            TilingMode::Floating => {
+                self.wm.clamp_workspace_floats(monitor, active, usable);
+                let first_arrangement = tiled.iter().all(|&id| self.wm.floating_rect(id).is_none());
+                let count = tiled.len();
+                for (index, &id) in tiled.iter().enumerate() {
+                    if self.wm.floating_rect(id).is_none() {
+                        let rect =
+                            layout::floating_placement(usable, index, count, first_arrangement);
+                        self.wm.ensure_workspace_float_rect(id, rect);
+                    }
+                }
+                Ok(tiled
+                    .iter()
+                    .filter_map(|&id| {
+                        self.wm.floating_rect(id).map(|frame| layout::Placement {
+                            window: id,
+                            frame,
+                            content: frame,
+                        })
+                    })
+                    .collect())
             }
         };
         let placements = match placements {
@@ -909,7 +945,15 @@ impl Compositor {
                         || self
                             .column_resize
                             .as_ref()
-                            .is_some_and(|resize| resize.left == id || resize.right == id));
+                            .is_some_and(|resize| match resize.kind {
+                                DividerResize::Columns { left, right } => left == id || right == id,
+                                DividerResize::MasterStack { .. } => {
+                                    self.wm.owner(id).is_some_and(|owner| {
+                                        owner.monitor == resize.monitor
+                                            && owner.workspace == resize.workspace
+                                    })
+                                }
+                            }));
                 #[cfg(not(feature = "native"))]
                 let defer = false;
                 if defer {
@@ -1100,6 +1144,9 @@ impl Compositor {
             return None;
         }
         let mode = self.wm.tiling_mode(owner.monitor, owner.workspace)?;
+        if mode == TilingMode::Floating {
+            return None;
+        }
         tiled.iter().enumerate().find_map(|(index, &id)| {
             let rect = self.tile_geometry.get(&id)?;
             if position.x < f64::from(rect.x)
@@ -1347,23 +1394,73 @@ impl Compositor {
     fn column_divider_at(
         &self,
         position: Point<f64, Logical>,
-    ) -> Option<(MonitorId, WindowId, WindowId)> {
+    ) -> Option<(MonitorId, crate::wm::WorkspaceId, DividerResize)> {
         let monitor = self.monitor_at(position)?;
         let workspace = self.wm.active_workspace(monitor)?;
-        if self.wm.tiling_mode(monitor, workspace) != Some(TilingMode::SideBySide) {
-            return None;
-        }
         let tiles = self.wm.tiled_windows(monitor, workspace)?;
-        tiles.windows(2).find_map(|pair| {
-            let left = self.tile_geometry.get(&pair[0])?;
-            let right = self.tile_geometry.get(&pair[1])?;
-            let edge = (f64::from(left.x + left.width) + f64::from(right.x)) / 2.0;
-            (position.x >= edge - 4.0
-                && position.x <= edge + 4.0
-                && position.y >= f64::from(left.y.max(right.y) + decorations::TITLE_HEIGHT)
-                && position.y < f64::from((left.y + left.height).min(right.y + right.height)))
-            .then_some((monitor, pair[0], pair[1]))
-        })
+        match self.wm.tiling_mode(monitor, workspace)? {
+            TilingMode::Floating => None,
+            TilingMode::SideBySide => tiles.windows(2).find_map(|pair| {
+                let left = self.tile_geometry.get(&pair[0])?;
+                let right = self.tile_geometry.get(&pair[1])?;
+                let edge = (f64::from(left.x + left.width) + f64::from(right.x)) / 2.0;
+                (position.x >= edge - 4.0
+                    && position.x <= edge + 4.0
+                    && position.y >= f64::from(left.y.max(right.y) + decorations::TITLE_HEIGHT)
+                    && position.y < f64::from((left.y + left.height).min(right.y + right.height)))
+                .then_some((
+                    monitor,
+                    workspace,
+                    DividerResize::Columns {
+                        left: pair[0],
+                        right: pair[1],
+                    },
+                ))
+            }),
+            TilingMode::MasterStack => {
+                let master_count = self.layout_settings.master_count.min(tiles.len());
+                if master_count == 0 || master_count == tiles.len() {
+                    return None;
+                }
+                let master = self.tile_geometry.get(&tiles[0])?;
+                let stack = self.tile_geometry.get(&tiles[master_count])?;
+                let edge = (f64::from(master.x + master.width) + f64::from(stack.x)) / 2.0;
+                let output = self
+                    .output_monitors
+                    .iter()
+                    .find(|(_, id)| **id == monitor)?
+                    .0;
+                let area = global_usable_area(
+                    *self.usable_areas.get(output)?,
+                    self.space.output_geometry(output)?.loc,
+                );
+                let shared_width = master.width + stack.width;
+                let start_ratio = self.wm.master_ratio(monitor, workspace)?.thousandths();
+                let over_titlebar = tiles.iter().any(|id| {
+                    self.tile_geometry.get(id).is_some_and(|frame| {
+                        position.y >= f64::from(frame.y)
+                            && position.y < f64::from(frame.y + decorations::TITLE_HEIGHT)
+                    })
+                });
+                (shared_width > 0
+                    && position.x >= edge - 4.0
+                    && position.x <= edge + 4.0
+                    && position.y >= f64::from(area.loc.y)
+                    && position.y < f64::from(area.loc.y + area.size.h)
+                    && !over_titlebar)
+                    .then_some({
+                        (
+                            monitor,
+                            workspace,
+                            DividerResize::MasterStack {
+                                start_ratio,
+                                start_x: position.x,
+                                shared_width,
+                            },
+                        )
+                    })
+            }
+        }
     }
 
     pub(crate) fn column_resize_cursor_at(&self, position: Point<f64, Logical>) -> bool {
@@ -1391,13 +1488,13 @@ impl Compositor {
     /// Grab the shared vertical edge below titlebars without changing either
     /// window's floating/tiled status or forwarding the press to a client.
     pub(crate) fn begin_column_resize(&mut self, position: Point<f64, Logical>) -> bool {
-        let Some((monitor, left, right)) = self.column_divider_at(position) else {
+        let Some((monitor, workspace, kind)) = self.column_divider_at(position) else {
             return false;
         };
         self.column_resize = Some(ColumnResize {
             monitor,
-            left,
-            right,
+            workspace,
+            kind,
             last_x: position.x,
         });
         true
@@ -1411,16 +1508,36 @@ impl Compositor {
         let Some(resize) = &mut self.column_resize else {
             return;
         };
+        if self.wm.active_workspace(resize.monitor) != Some(resize.workspace) {
+            self.column_resize = None;
+            return;
+        }
         let delta = (position.x - resize.last_x).round() as i32;
         if delta == 0 {
             return;
         }
         resize.last_x += f64::from(delta);
-        let (monitor, left, right) = (resize.monitor, resize.left, resize.right);
-        if self
-            .resize_column_pair(monitor, left, right, delta)
-            .is_err()
-        {
+        let (monitor, workspace, kind, last_x) =
+            (resize.monitor, resize.workspace, resize.kind, resize.last_x);
+        let command = match kind {
+            DividerResize::Columns { left, right } => {
+                self.resize_column_pair(monitor, left, right, delta)
+            }
+            DividerResize::MasterStack {
+                start_ratio,
+                start_x,
+                shared_width,
+            } => {
+                let offset = ((last_x - start_x) * 1000.0 / f64::from(shared_width)).round() as i32;
+                let ratio = (i32::from(start_ratio) + offset).clamp(1, 999) as u16;
+                self.apply_command(WmCommand::SetMasterRatio {
+                    monitor,
+                    workspace,
+                    ratio,
+                })
+            }
+        };
+        if command.is_err() {
             self.column_resize = None;
         }
     }
@@ -1618,6 +1735,30 @@ impl Compositor {
         Ok(effect)
     }
 
+    /// A same-user control request changes only the named output's view. It
+    /// does not transfer keyboard focus to that monitor, and lock state never
+    /// accepts control commands.
+    pub fn switch_workspace_from_control(&mut self, output: &str, workspace: u32) {
+        if self.is_locked() {
+            tracing::debug!("ignored workspace control request while locked");
+            return;
+        }
+        let Some(workspace) = crate::wm::WorkspaceId::new(workspace) else {
+            return;
+        };
+        let Some(monitor) = self
+            .output_monitors
+            .iter()
+            .find_map(|(display, &monitor)| (display.name() == output).then_some(monitor))
+        else {
+            tracing::debug!(output, "ignored control request for unknown output");
+            return;
+        };
+        if let Err(error) = self.apply_command(WmCommand::SwitchWorkspace { monitor, workspace }) {
+            tracing::warn!(?error, output, "workspace control request rejected");
+        }
+    }
+
     /// Keep hidden windows in the registry, not in Space (the rendered scene).
     fn reconcile_monitor(&mut self, monitor: MonitorId) {
         for (&id, window) in &self.scene_windows {
@@ -1696,6 +1837,16 @@ impl Compositor {
             } else {
                 self.sync_keyboard_focus(serial);
             }
+        }
+    }
+
+    pub(crate) fn raise_floating_on_click(&mut self, window: &Window) {
+        if let Some(&id) = self.window_ids.get(window)
+            && self.wm.floating_rect(id).is_some()
+            && let Some(scene) = self.scene_windows.get(&id)
+        {
+            self.space.raise_element(scene, false);
+            self.needs_repaint = true;
         }
     }
 
@@ -2125,6 +2276,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_control_targets_output_without_moving_keyboard_monitor() {
+        let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
+        let display = Display::<Compositor>::new().unwrap();
+        let mut compositor =
+            Compositor::new(&mut loop_, display, Keybindings::default(), "seat0").unwrap();
+        let mut monitors = Vec::new();
+        for (index, name) in ["HDMI-A-2", "DP-4"].into_iter().enumerate() {
+            let output = smithay::output::Output::new(
+                name.into(),
+                smithay::output::PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: smithay::output::Subpixel::Unknown,
+                    make: "test".into(),
+                    model: "virtual".into(),
+                },
+            );
+            output.change_current_state(
+                Some(smithay::output::Mode {
+                    size: (400, 200).into(),
+                    refresh: 60_000,
+                }),
+                None,
+                None,
+                Some(((index as i32) * 400, 0).into()),
+            );
+            compositor
+                .space
+                .map_output(&output, ((index as i32) * 400, 0));
+            compositor.register_output(&output);
+            monitors.push(compositor.monitor_for_output(&output).unwrap());
+        }
+        assert_eq!(compositor.wm.active_monitor(), Some(monitors[0]));
+        compositor.switch_workspace_from_control("DP-4", 7);
+        assert_eq!(
+            compositor
+                .wm
+                .active_workspace(monitors[1])
+                .unwrap()
+                .number(),
+            7
+        );
+        assert_eq!(compositor.wm.active_monitor(), Some(monitors[0]));
+        compositor.switch_workspace_from_control("missing", 2);
+        compositor.switch_workspace_from_control("DP-4", 0);
+        compositor.lock_screen = Some(LockSession {
+            confirmation: None,
+            surfaces: HashMap::new(),
+            covered: HashSet::new(),
+        });
+        compositor.switch_workspace_from_control("DP-4", 8);
+        assert_eq!(
+            compositor
+                .wm
+                .active_workspace(monitors[1])
+                .unwrap()
+                .number(),
+            7
+        );
+    }
+
+    #[test]
     fn insertion_line_spans_the_slot_in_purple_without_covering_a_window() {
         let area = Rect {
             x: 0,
@@ -2198,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn divider_drag_resizes_columns_but_not_titlebar_or_master_stack() {
+    fn divider_drag_resizes_master_stack_and_side_by_side_but_not_titlebar() {
         let mut loop_ = EventLoop::<crate::LoopData>::try_new().unwrap();
         let display = Display::<Compositor>::new().unwrap();
         let mut compositor =
@@ -2256,8 +2468,28 @@ mod tests {
                 height: 200,
             },
         );
-        assert!(!compositor.column_resize_cursor_at((100.0, 50.0).into()));
-        assert!(!compositor.begin_column_resize((100.0, 50.0).into()));
+        assert!(!compositor.begin_column_resize((100.0, 10.0).into()));
+        assert!(compositor.column_resize_cursor_at((100.0, 50.0).into()));
+        assert!(compositor.begin_column_resize((100.0, 50.0).into()));
+        compositor.move_column_resize((110.0, 50.0).into());
+        assert_eq!(
+            compositor
+                .wm
+                .master_ratio(monitor, crate::wm::WorkspaceId::FIRST)
+                .unwrap()
+                .thousandths(),
+            650
+        );
+        compositor.move_column_resize((200.0, 50.0).into());
+        assert_eq!(
+            compositor
+                .wm
+                .master_ratio(monitor, crate::wm::WorkspaceId::FIRST)
+                .unwrap()
+                .thousandths(),
+            800
+        );
+        compositor.end_column_resize();
         compositor
             .apply_command(WmCommand::ToggleTilingMode { monitor })
             .unwrap();

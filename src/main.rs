@@ -5,13 +5,16 @@ use std::{
     time::Instant,
 };
 
-use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
+use smithay::reexports::{
+    calloop::{EventLoop, channel::Event as ChannelEvent},
+    wayland_server::Display,
+};
 
 use devel_wm::{
     LoopData,
     compositor::{Compositor, run_nested},
     config::Keybindings,
-    ipc::IpcServer,
+    ipc::{ControlServer, IpcServer},
 };
 
 const USAGE: &str = "Usage: devel-wm [--backend nested|native] [--config PATH] [--native-present CONNECTOR | --native-session [CONNECTOR[,CONNECTOR]]] [--native-switch-vt N]\nNative without a display option is discovery only; --native-session runs until intentional exit. Omit its connector list to discover outputs on one DRM card automatically. Named connectors remain available for recovery. --native-switch-vt requires --native-present CONNECTOR.";
@@ -278,6 +281,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_nested(&mut event_loop, &mut data)?;
     let ipc = IpcServer::start(&data.compositor.ipc_snapshot())?;
     println!("DEVEL_WM_IPC={}", ipc.path().display());
+    let (control, requests) = ControlServer::start(&ipc)?;
+    event_loop
+        .handle()
+        .insert_source(requests, |event, _, data| {
+            if let ChannelEvent::Msg(request) = event {
+                data.compositor
+                    .switch_workspace_from_control(&request.output, request.workspace);
+            }
+        })?;
+    println!("DEVEL_WM_CONTROL={}", control.path().display());
     data.ipc = Some(ipc);
     println!(
         "WAYLAND_DISPLAY={}",

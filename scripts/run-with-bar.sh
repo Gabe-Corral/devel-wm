@@ -60,8 +60,10 @@ bar_pid=
 alacritty_pids=()
 wayland_display=
 ipc_socket=
+control_socket=
 wayland_socket_inode=
 ipc_socket_inode=
+control_socket_inode=
 
 cleanup() {
     trap - EXIT INT TERM
@@ -84,6 +86,10 @@ cleanup() {
     if [[ -n $ipc_socket_inode && $ipc_socket == "$XDG_RUNTIME_DIR/devel-wm/"* \
           && -S $ipc_socket && $(stat -Lc '%d:%i' -- "$ipc_socket") == "$ipc_socket_inode" ]]; then
         rm -f -- "$ipc_socket"
+    fi
+    if [[ -n $control_socket_inode && $control_socket == "$XDG_RUNTIME_DIR/devel-wm/"* \
+          && -S $control_socket && $(stat -Lc '%d:%i' -- "$control_socket") == "$control_socket_inode" ]]; then
+        rm -f -- "$control_socket"
     fi
     if [[ -n $wayland_socket_inode && $wayland_display =~ ^wayland-[0-9]+$ \
           && -S $XDG_RUNTIME_DIR/$wayland_display \
@@ -113,11 +119,15 @@ deadline=$((SECONDS + 15))
 while (( SECONDS < deadline )); do
     display_line=$(grep -m1 '^WAYLAND_DISPLAY=' "$log" || true)
     ipc_line=$(grep -m1 '^DEVEL_WM_IPC=' "$log" || true)
-    if [[ -n $display_line && -n $ipc_line ]]; then
+    control_line=$(grep -m1 '^DEVEL_WM_CONTROL=' "$log" || true)
+    if [[ -n $display_line && -n $ipc_line && -n $control_line ]]; then
         wayland_display=${display_line#WAYLAND_DISPLAY=}
         ipc_socket=${ipc_line#DEVEL_WM_IPC=}
-        if [[ -S $ipc_socket && -S $XDG_RUNTIME_DIR/$wayland_display ]]; then
+        control_socket=${control_line#DEVEL_WM_CONTROL=}
+        if [[ $control_socket == "$XDG_RUNTIME_DIR/devel-wm/"* \
+              && -S $control_socket && -S $ipc_socket && -S $XDG_RUNTIME_DIR/$wayland_display ]]; then
             ipc_socket_inode=$(stat -Lc '%d:%i' -- "$ipc_socket")
+            control_socket_inode=$(stat -Lc '%d:%i' -- "$control_socket")
             wayland_socket_inode=$(stat -Lc '%d:%i' -- "$XDG_RUNTIME_DIR/$wayland_display")
             break
         fi
@@ -129,12 +139,14 @@ while (( SECONDS < deadline )); do
     sleep 0.1
 done
 
-if [[ -z $wayland_display || -z $ipc_socket || ! -S $ipc_socket || ! -S $XDG_RUNTIME_DIR/$wayland_display ]]; then
-    echo "Timed out waiting for devel-wm's Wayland and IPC sockets" >&2
+if [[ -z $wayland_display || -z $ipc_socket || -z $control_socket \
+      || ! -S $ipc_socket || ! -S $control_socket || ! -S $XDG_RUNTIME_DIR/$wayland_display ]]; then
+    echo "Timed out waiting for devel-wm's Wayland, IPC and control sockets" >&2
     exit 1
 fi
 
 env -u DISPLAY WAYLAND_DISPLAY="$wayland_display" DEVEL_WM_IPC="$ipc_socket" \
+    DEVEL_WM_CONTROL="$control_socket" \
     "$root/../devel-bar/target/debug/devel-bar" &
 bar_pid=$!
 echo "devel-bar running on $wayland_display (IPC: $ipc_socket)"

@@ -126,6 +126,41 @@ pub struct Placement {
     pub content: Rect,
 }
 
+/// Initial floating-mode placement: a restrained grid for an existing group
+/// of tiles, and a staggered center placement for later windows. Coordinates
+/// use the output's usable logical area, not the full physical display.
+pub fn floating_placement(area: Rect, index: usize, count: usize, initial: bool) -> Rect {
+    let width = area.width.max(1);
+    let height = area.height.max(1);
+    let (x, y, w, h) = if initial {
+        let columns = count.min((width / 850).max(1) as usize).clamp(1, 3);
+        let rows = count.div_ceil(columns).max(1);
+        let cell_w = (width / columns as i32).max(1);
+        let cell_h = (height / rows as i32).max(1);
+        let w = (cell_w - 24).clamp(1, 1100);
+        let h = (cell_h - 24).clamp(1, 850);
+        let x = (index % columns) as i32 * cell_w + (cell_w - w) / 2;
+        let y = (index / columns) as i32 * cell_h + (cell_h - h) / 2;
+        (x, y, w, h)
+    } else {
+        let w = (width - 48).clamp(1, 1100);
+        let h = (height - 48).clamp(1, 850);
+        let offset = (index % 7) as i32 * 32;
+        (
+            ((width - w) / 2 + offset).min(width - w),
+            ((height - h) / 2 + offset).min(height - h),
+            w,
+            h,
+        )
+    };
+    Rect {
+        x: area.x.saturating_add(x),
+        y: area.y.saturating_add(y),
+        width: w,
+        height: h,
+    }
+}
+
 /// Arrange distinct, ordered tiled IDs; floating and fullscreen windows are
 /// excluded by the caller. Validation is independent of the number of windows.
 /// Degenerate areas yield zero-sized rectangles rather than negative geometry.
@@ -326,6 +361,32 @@ fn place_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_layout_centers_one_and_spreads_existing_windows_on_ultrawide() {
+        let area = Rect {
+            x: 3840,
+            y: 32,
+            width: 3440,
+            height: 1408,
+        };
+        let single = floating_placement(area, 0, 1, true);
+        assert_eq!(single.width, 1100);
+        assert_eq!(single.height, 850);
+        assert_eq!(single.x, area.x + (area.width - 1100) / 2);
+        let rects: Vec<_> = (0..3)
+            .map(|i| floating_placement(area, i, 3, true))
+            .collect();
+        for pair in rects.windows(2) {
+            assert!(pair[0].x + pair[0].width <= pair[1].x);
+        }
+        for rect in rects {
+            assert!(rect.x >= area.x && rect.x + rect.width <= area.x + area.width);
+            assert!(rect.y >= area.y && rect.y + rect.height <= area.y + area.height);
+        }
+        let new = floating_placement(area, 3, 4, false);
+        assert!(new.x > single.x);
+    }
     use crate::wm::{WindowOwner, WmState, WorkspaceId};
 
     fn ids(count: usize) -> Vec<WindowId> {

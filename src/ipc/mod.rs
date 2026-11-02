@@ -1,4 +1,4 @@
-//! Read-only, newline-delimited JSON snapshots for local bar clients.
+//! Read-only snapshots and a separate same-user workspace control socket.
 
 use std::{
     fs,
@@ -19,6 +19,7 @@ use std::{
 };
 
 use serde::Serialize;
+use smithay::reexports::calloop::channel::{self, Channel, Sender};
 
 use crate::wm::{MonitorId, WindowId, WmState};
 
@@ -299,6 +300,169 @@ fn handle_client(mut stream: UnixStream, shared: Arc<Mutex<Shared>>) -> io::Resu
             Ok(())
         }
         _ => stream.write_all(b"{\"error\":\"unknown request\"}\n"),
+    }
+}
+
+/// Only this narrow action is accepted on the control socket. The compositor
+/// validates the output again on its event-loop thread before applying it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlRequest {
+    pub output: String,
+    pub workspace: u32,
+}
+
+fn parse_control_request(line: &[u8]) -> io::Result<ControlRequest> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "control request is not UTF-8"))?;
+    let mut words = text.trim_end_matches('\n').split(' ');
+    let (Some("switch-workspace"), Some(output), Some(number), None) =
+        (words.next(), words.next(), words.next(), words.next())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown control request",
+        ));
+    };
+    if output.is_empty()
+        || output.len() > 64
+        || !output
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid output name",
+        ));
+    }
+    let workspace = number
+        .parse::<u32>()
+        .ok()
+        .filter(|&n| (1..=999).contains(&n))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid workspace"))?;
+    Ok(ControlRequest {
+        output: output.to_owned(),
+        workspace,
+    })
+}
+
+fn same_user(stream: &UnixStream) -> io::Result<bool> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: both pointers reference writable local variables with the sizes
+    // provided to getsockopt; the stream owns a valid Unix socket descriptor.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(
+        len as usize == std::mem::size_of::<libc::ucred>()
+            && cred.uid == unsafe { libc::geteuid() },
+    )
+}
+
+fn handle_control(mut stream: UnixStream, sender: &Sender<ControlRequest>) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    if !same_user(&stream)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control peer is not this user",
+        ));
+    }
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        line.push(byte[0]);
+        if line.len() > 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control request too long",
+            ));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    match parse_control_request(&line) {
+        Ok(request) => {
+            sender
+                .send(request)
+                .map_err(|_| io::Error::other("control loop stopped"))?;
+            stream.write_all(b"{\"queued\":true}\n")
+        }
+        Err(_) => stream.write_all(b"{\"error\":\"invalid request\"}\n"),
+    }
+}
+
+/// Local control endpoint is distinct from the display-only snapshot feed.
+/// Filesystem permissions and SO_PEERCRED restrict it to this Unix user, not
+/// to a particular same-UID program. Requests are queued, not executed here.
+pub struct ControlServer {
+    path: PathBuf,
+    stopping: Arc<AtomicBool>,
+    listener: Option<JoinHandle<()>>,
+}
+
+impl ControlServer {
+    pub fn start(ipc: &IpcServer) -> io::Result<(Self, Channel<ControlRequest>)> {
+        let path = ipc.path.with_extension("control.sock");
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let (sender, receiver) = channel::channel();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = stopping.clone();
+        let worker = thread::spawn(move || {
+            for connection in listener.incoming() {
+                if worker_stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(connection) = connection else {
+                    break;
+                };
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    if let Err(err) = handle_control(connection, &sender) {
+                        tracing::debug!(%err, "control client disconnected");
+                    }
+                });
+            }
+        });
+        Ok((
+            Self {
+                path,
+                stopping,
+                listener: Some(worker),
+            },
+            receiver,
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(&self.path);
+        if let Some(worker) = self.listener.take() {
+            let _ = worker.join();
+        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -602,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn control_parser_accepts_only_bounded_workspace_switches() {
+        assert_eq!(
+            parse_control_request(b"switch-workspace HDMI-A-2 9\n").unwrap(),
+            ControlRequest {
+                output: "HDMI-A-2".into(),
+                workspace: 9
+            }
+        );
+        for request in [
+            &b"get\n"[..],
+            &b"subscribe\n"[..],
+            &b"switch-workspace DP-4 0\n"[..],
+            &b"switch-workspace DP-4 1000\n"[..],
+            &b"switch-workspace DP-4 1 extra\n"[..],
+            &b"switch-workspace ../evil 1\n"[..],
+            &b"switch-workspace DP-4 -1\n"[..],
+        ] {
+            assert!(parse_control_request(request).is_err(), "{request:?}");
+        }
+    }
+
+    #[test]
     fn server_creates_private_socket_and_cleans_it_up() {
         let runtime = PathBuf::from("/tmp/opencode").join(format!(
             "devel-wm-ipc-test-{}-{}",
@@ -621,13 +807,36 @@ mod tests {
         let server = IpcServer::start_in(&runtime, &snapshot).unwrap();
         let path = server.path().to_path_buf();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let (control, requests) = ControlServer::start(&server).unwrap();
+        let control_path = control.path().to_path_buf();
+        assert_eq!(fs::metadata(&control_path).unwrap().mode() & 0o777, 0o600);
+        let mut command = UnixStream::connect(&control_path).unwrap();
+        command.write_all(b"switch-workspace DP-4 3\n").unwrap();
+        let mut ack = String::new();
+        command.read_to_string(&mut ack).unwrap();
+        assert_eq!(ack, "{\"queued\":true}\n");
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            ControlRequest {
+                output: "DP-4".into(),
+                workspace: 3
+            }
+        );
+        let mut invalid = UnixStream::connect(&control_path).unwrap();
+        invalid.write_all(b"get\n").unwrap();
+        let mut error = String::new();
+        invalid.read_to_string(&mut error).unwrap();
+        assert!(error.contains("invalid request"));
+        assert!(requests.try_recv().is_err());
         let mut client = UnixStream::connect(&path).unwrap();
         client.write_all(b"get\n").unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
         assert_eq!(response, encode(&snapshot));
         drop(server);
+        drop(control);
         assert!(!path.exists());
+        assert!(!control_path.exists());
         fs::remove_dir(runtime.join("devel-wm")).unwrap();
         fs::remove_dir(runtime).unwrap();
     }

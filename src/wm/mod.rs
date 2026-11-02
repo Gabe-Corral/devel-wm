@@ -68,6 +68,9 @@ pub enum WmCommand {
     ToggleTilingMode {
         monitor: MonitorId,
     },
+    ToggleFloatingMode {
+        monitor: MonitorId,
+    },
     ResizeColumnPair {
         monitor: MonitorId,
         left: WindowId,
@@ -123,6 +126,11 @@ pub enum WmCommand {
         monitor: MonitorId,
         direction: Direction,
     },
+    SetMasterRatio {
+        monitor: MonitorId,
+        workspace: WorkspaceId,
+        ratio: u16,
+    },
     ToggleFocusedFloating {
         monitor: MonitorId,
         tiled_rect: Rect,
@@ -163,6 +171,7 @@ pub enum TilingMode {
     #[default]
     MasterStack,
     SideBySide,
+    Floating,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +221,8 @@ struct WorkspaceState {
     floating: Vec<WindowId>,
     master_ratio: MasterRatio,
     tiling_mode: TilingMode,
+    previous_tiling_mode: TilingMode,
+    workspace_float_rects: BTreeMap<WindowId, Rect>,
     column_weights: BTreeMap<WindowId, u32>,
     groups: BTreeMap<WindowId, WindowGroup>,
 }
@@ -229,6 +240,8 @@ impl Default for WorkspaceState {
             floating: Vec::new(),
             master_ratio: MasterRatio::new(600).expect("valid default ratio"),
             tiling_mode: TilingMode::default(),
+            previous_tiling_mode: TilingMode::default(),
+            workspace_float_rects: BTreeMap::new(),
             column_weights: BTreeMap::new(),
             groups: BTreeMap::new(),
         }
@@ -282,6 +295,11 @@ impl WorkspaceState {
                 let next_root = group.tabs[0];
                 self.tiled[slot] = next_root;
                 if next_root != root
+                    && let Some(rect) = self.workspace_float_rects.remove(&root)
+                {
+                    self.workspace_float_rects.insert(next_root, rect);
+                }
+                if next_root != root
                     && let Some(weight) = self.column_weights.remove(&root)
                 {
                     self.column_weights.insert(next_root, weight);
@@ -290,6 +308,11 @@ impl WorkspaceState {
             } else {
                 let remaining = group.tabs[0];
                 self.tiled[slot] = remaining;
+                if remaining != root
+                    && let Some(rect) = self.workspace_float_rects.remove(&root)
+                {
+                    self.workspace_float_rects.insert(remaining, rect);
+                }
                 if remaining != root
                     && let Some(weight) = self.column_weights.remove(&root)
                 {
@@ -302,6 +325,7 @@ impl WorkspaceState {
         } else {
             self.tiled.remove(slot);
             self.column_weights.remove(&root);
+            self.workspace_float_rects.remove(&root);
             if self.focused_window == Some(window) {
                 self.focused_window = self
                     .tiled
@@ -436,7 +460,62 @@ impl WmState {
     }
 
     pub fn floating_rect(&self, window: WindowId) -> Option<Rect> {
-        self.floating_rects.get(&window).copied()
+        self.floating_rects.get(&window).copied().or_else(|| {
+            let owner = self.owner(window)?;
+            let state = self
+                .monitors
+                .get(&owner.monitor)?
+                .workspaces
+                .get(&owner.workspace)?;
+            (state.tiling_mode == TilingMode::Floating)
+                .then(|| {
+                    state
+                        .workspace_float_rects
+                        .get(&state.tile_root(window)?)
+                        .copied()
+                })
+                .flatten()
+        })
+    }
+
+    /// Remember a floating-mode placement without changing the tile order or
+    /// turning a tile into an individually floating window.
+    pub fn ensure_workspace_float_rect(&mut self, window: WindowId, rect: Rect) -> bool {
+        if !valid_floating_rect(rect) {
+            return false;
+        }
+        let Some(owner) = self.owner(window) else {
+            return false;
+        };
+        let state = &mut self
+            .monitors
+            .get_mut(&owner.monitor)
+            .expect("owner monitor")
+            .workspaces
+            .get_mut(&owner.workspace)
+            .expect("owner workspace");
+        if state.tiling_mode != TilingMode::Floating || !state.tiled.contains(&window) {
+            return false;
+        }
+        state.workspace_float_rects.entry(window).or_insert(rect);
+        true
+    }
+
+    pub fn clamp_workspace_floats(
+        &mut self,
+        monitor: MonitorId,
+        workspace: WorkspaceId,
+        area: Rect,
+    ) {
+        if let Some(state) = self
+            .monitors
+            .get_mut(&monitor)
+            .and_then(|state| state.workspaces.get_mut(&workspace))
+        {
+            for rect in state.workspace_float_rects.values_mut() {
+                *rect = clamp_floating_to_area(*rect, area);
+            }
+        }
     }
 
     pub fn master_ratio(&self, monitor: MonitorId, workspace: WorkspaceId) -> Option<MasterRatio> {
@@ -564,6 +643,10 @@ impl WmState {
                 .workspaces
                 .get_mut(&from_workspace)
                 .expect("window workspace");
+            let mode_rect = from
+                .tile_root(id)
+                .and_then(|root| from.workspace_float_rects.get(&root).copied())
+                .map(|rect| clamp_floating_to_area(rect, area));
             from.remove_window(id, floating);
             if let Some(rect) = self.floating_rects.get_mut(&id) {
                 *rect = clamp_floating_to_area(*rect, area);
@@ -590,6 +673,9 @@ impl WmState {
                 dest.floating.push(id);
             } else {
                 dest.tiled.push(id);
+                if let Some(rect) = mode_rect {
+                    dest.workspace_float_rects.insert(id, rect);
+                }
             }
         }
         {
@@ -627,6 +713,20 @@ impl WmState {
     /// Preserve floating positions relative to a monitor when its logical
     /// origin shifts after a neighbor is removed or reattached.
     pub fn shift_monitor_floats(&mut self, monitor: MonitorId, dx: i32, dy: i32, area: Rect) {
+        if let Some(state) = self.monitors.get_mut(&monitor) {
+            for workspace in state.workspaces.values_mut() {
+                for rect in workspace.workspace_float_rects.values_mut() {
+                    *rect = clamp_floating_to_area(
+                        Rect {
+                            x: rect.x.saturating_add(dx),
+                            y: rect.y.saturating_add(dy),
+                            ..*rect
+                        },
+                        area,
+                    );
+                }
+            }
+        }
         for (&id, rect) in &mut self.floating_rects {
             if self
                 .windows
@@ -810,7 +910,29 @@ impl WmState {
                 active.tiling_mode = match active.tiling_mode {
                     TilingMode::MasterStack => TilingMode::SideBySide,
                     TilingMode::SideBySide => TilingMode::MasterStack,
+                    TilingMode::Floating => match active.previous_tiling_mode {
+                        TilingMode::MasterStack => TilingMode::SideBySide,
+                        _ => TilingMode::MasterStack,
+                    },
                 };
+                active.previous_tiling_mode = active.tiling_mode;
+                Ok(CommandEffect::LayoutChanged { monitor })
+            }
+            WmCommand::ToggleFloatingMode { monitor } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                let active = state
+                    .workspaces
+                    .get_mut(&state.active_workspace)
+                    .expect("active workspace");
+                if active.tiling_mode == TilingMode::Floating {
+                    active.tiling_mode = active.previous_tiling_mode;
+                } else {
+                    active.previous_tiling_mode = active.tiling_mode;
+                    active.tiling_mode = TilingMode::Floating;
+                }
                 Ok(CommandEffect::LayoutChanged { monitor })
             }
             WmCommand::ResizeColumnPair {
@@ -883,6 +1005,9 @@ impl WmState {
                     .workspaces
                     .get_mut(&source)
                     .expect("active workspace");
+                let mode_rect = source_state
+                    .tile_root(window)
+                    .and_then(|root| source_state.workspace_float_rects.get(&root).copied());
                 source_state.remove_window(window, floating);
                 let target = monitor_state.workspaces.entry(workspace).or_default();
                 target.focused_window.get_or_insert(window);
@@ -890,6 +1015,9 @@ impl WmState {
                     target.floating.push(window);
                 } else {
                     target.tiled.push(window);
+                    if let Some(rect) = mode_rect {
+                        target.workspace_float_rects.insert(window, rect);
+                    }
                 }
                 self.windows
                     .get_mut(&window)
@@ -1094,6 +1222,32 @@ impl WmState {
                 active.master_ratio = MasterRatio::new(ratio).expect("clamped ratio");
                 Ok(CommandEffect::LayoutChanged { monitor })
             }
+            WmCommand::SetMasterRatio {
+                monitor,
+                workspace,
+                ratio,
+            } => {
+                let state = self
+                    .monitors
+                    .get_mut(&monitor)
+                    .ok_or(CommandError::UnknownMonitor)?;
+                if state.active_workspace != workspace {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let active = state
+                    .workspaces
+                    .get_mut(&workspace)
+                    .expect("active workspace");
+                if active.tiling_mode != TilingMode::MasterStack || active.tiled.len() < 2 {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                let ratio = ratio.clamp(MASTER_RATIO_MIN as u16, MASTER_RATIO_MAX as u16);
+                if active.master_ratio.thousandths() == ratio {
+                    return Ok(CommandEffect::Unchanged);
+                }
+                active.master_ratio = MasterRatio::new(ratio).expect("clamped ratio");
+                Ok(CommandEffect::LayoutChanged { monitor })
+            }
             WmCommand::ToggleFocusedFloating {
                 monitor,
                 tiled_rect,
@@ -1110,12 +1264,19 @@ impl WmState {
                 if let Some(rect) = self.floating_rects.remove(&window) {
                     active.floating.retain(|&id| id != window);
                     active.tiled.push(window);
+                    if active.tiling_mode == TilingMode::Floating {
+                        active.workspace_float_rects.insert(window, rect);
+                    }
                     self.saved_floating_rects.insert(window, rect);
                 } else {
-                    let rect = self
-                        .saved_floating_rects
-                        .get(&window)
+                    let root = active
+                        .tile_root(window)
+                        .ok_or(CommandError::UnknownWindow)?;
+                    let rect = active
+                        .workspace_float_rects
+                        .get(&root)
                         .copied()
+                        .or_else(|| self.saved_floating_rects.get(&window).copied())
                         .unwrap_or(tiled_rect);
                     if !valid_floating_rect(rect) {
                         return Err(CommandError::InvalidGeometry);
@@ -1123,6 +1284,9 @@ impl WmState {
                     active
                         .detach_tab(window)
                         .ok_or(CommandError::UnknownWindow)?;
+                    if !active.tiled.contains(&root) {
+                        active.workspace_float_rects.remove(&root);
+                    }
                     active.floating.push(window);
                     active.focused_window = Some(window);
                     self.saved_floating_rects.remove(&window);
@@ -1149,6 +1313,7 @@ impl WmState {
                 active
                     .detach_tab(window)
                     .ok_or(CommandError::UnknownWindow)?;
+                active.workspace_float_rects.remove(&window);
                 active.floating.push(window);
                 active.focused_window = Some(window);
                 self.saved_floating_rects.remove(&window);
@@ -1171,9 +1336,22 @@ impl WmState {
                 if owner.monitor != monitor {
                     return Err(CommandError::WrongMonitor);
                 }
+                let state = self
+                    .monitors
+                    .get_mut(&owner.monitor)
+                    .expect("known monitor")
+                    .workspaces
+                    .get_mut(&owner.workspace)
+                    .expect("known workspace");
+                let root = state.tile_root(window);
                 let rect = self
                     .floating_rects
                     .get_mut(&window)
+                    .or_else(|| {
+                        (state.tiling_mode == TilingMode::Floating)
+                            .then(|| state.workspace_float_rects.get_mut(&root?))
+                            .flatten()
+                    })
                     .ok_or(CommandError::NotFloating)?;
                 if x.checked_add(rect.width).is_none() || y.checked_add(rect.height).is_none() {
                     return Err(CommandError::InvalidGeometry);
@@ -1199,8 +1377,7 @@ impl WmState {
                     .active_workspace(destination)
                     .ok_or(CommandError::UnknownMonitor)?;
                 let rect = self
-                    .floating_rects
-                    .get(&window)
+                    .floating_rect(window)
                     .ok_or(CommandError::NotFloating)?;
                 if x.checked_add(rect.width).is_none() || y.checked_add(rect.height).is_none() {
                     return Err(CommandError::InvalidGeometry);
@@ -1220,7 +1397,7 @@ impl WmState {
                     .workspaces
                     .get_mut(&owner.workspace)
                     .expect("window's workspace must exist");
-                source.remove_window(window, true);
+                source.remove_window(window, self.floating_rects.contains_key(&window));
                 let target = self
                     .monitors
                     .get_mut(&destination)
@@ -1235,12 +1412,7 @@ impl WmState {
                     monitor: destination,
                     workspace: target_workspace,
                 };
-                let rect = self
-                    .floating_rects
-                    .get_mut(&window)
-                    .expect("floating window");
-                rect.x = x;
-                rect.y = y;
+                self.floating_rects.insert(window, Rect { x, y, ..rect });
                 Ok(CommandEffect::WindowTransferred {
                     from: owner.monitor,
                     to: destination,
@@ -1262,9 +1434,22 @@ impl WmState {
                 if owner.monitor != monitor {
                     return Err(CommandError::WrongMonitor);
                 }
+                let state = self
+                    .monitors
+                    .get_mut(&owner.monitor)
+                    .expect("known monitor")
+                    .workspaces
+                    .get_mut(&owner.workspace)
+                    .expect("known workspace");
+                let root = state.tile_root(window);
                 let current = self
                     .floating_rects
                     .get_mut(&window)
+                    .or_else(|| {
+                        (state.tiling_mode == TilingMode::Floating)
+                            .then(|| state.workspace_float_rects.get_mut(&root?))
+                            .flatten()
+                    })
                     .ok_or(CommandError::NotFloating)?;
                 if !valid_floating_rect(rect) {
                     return Err(CommandError::InvalidGeometry);
@@ -1389,6 +1574,9 @@ impl WmState {
             .get_mut(&owner.workspace)
             .expect("window's workspace must exist");
         workspace.remove_window(window, floating);
+        if floating {
+            workspace.workspace_float_rects.remove(&window);
+        }
         Some(owner)
     }
 }
@@ -1423,6 +1611,169 @@ fn clamp_floating_to_area(rect: Rect, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_mode_preserves_tiles_explicit_floats_and_workspace_modes() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let other = wm.add_monitor();
+        let ws = WorkspaceId::FIRST;
+        let windows: Vec<_> = (0..3)
+            .map(|_| {
+                wm.add_window(WindowOwner {
+                    monitor,
+                    workspace: ws,
+                })
+                .unwrap()
+            })
+            .collect();
+        wm.set_focus(monitor, Some(windows[2]));
+        let permanent = Rect {
+            x: 90,
+            y: 80,
+            width: 420,
+            height: 320,
+        };
+        wm.execute(WmCommand::FloatFocusedAt {
+            monitor,
+            rect: permanent,
+        })
+        .unwrap();
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        assert_eq!(wm.tiling_mode(monitor, ws), Some(TilingMode::Floating));
+        assert_eq!(wm.tiling_mode(other, ws), Some(TilingMode::MasterStack));
+        let temporary = Rect {
+            x: 200,
+            y: 50,
+            width: 900,
+            height: 640,
+        };
+        assert!(wm.ensure_workspace_float_rect(windows[0], temporary));
+        assert_eq!(wm.floating_rect(windows[0]), Some(temporary));
+        wm.execute(WmCommand::MoveFloating {
+            monitor,
+            window: windows[0],
+            x: 240,
+            y: 70,
+        })
+        .unwrap();
+        let changed = Rect {
+            x: 240,
+            y: 70,
+            width: 800,
+            height: 600,
+        };
+        wm.execute(WmCommand::ResizeFloating {
+            monitor,
+            window: windows[0],
+            rect: changed,
+        })
+        .unwrap();
+        assert_eq!(wm.floating_rect(windows[0]), Some(changed));
+        assert_eq!(wm.floating_rect(windows[2]), Some(permanent));
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        assert_eq!(wm.tiling_mode(monitor, ws), Some(TilingMode::MasterStack));
+        assert_eq!(wm.floating_rect(windows[0]), None);
+        assert_eq!(wm.floating_rect(windows[2]), Some(permanent));
+        assert_eq!(wm.tiled_windows(monitor, ws), Some(&windows[..2]));
+        assert_eq!(wm.keyboard_focus(), Some(windows[2]));
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        assert_eq!(wm.floating_rect(windows[0]), Some(changed));
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        assert_eq!(wm.tiling_mode(monitor, ws), Some(TilingMode::SideBySide));
+    }
+
+    #[test]
+    fn floating_mode_moved_window_keeps_reachable_placement_and_cleanup() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let ws = WorkspaceId::FIRST;
+        let window = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: ws,
+            })
+            .unwrap();
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        let rect = Rect {
+            x: 2000,
+            y: 30,
+            width: 400,
+            height: 300,
+        };
+        assert!(wm.ensure_workspace_float_rect(window, rect));
+        wm.clamp_workspace_floats(
+            monitor,
+            ws,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            },
+        );
+        assert!(wm.floating_rect(window).unwrap().x < 1000);
+        let next = WorkspaceId::new(2).unwrap();
+        wm.execute(WmCommand::MoveFocusedToWorkspace {
+            monitor,
+            workspace: next,
+        })
+        .unwrap();
+        assert_eq!(wm.floating_rect(window), None);
+        wm.execute(WmCommand::SwitchWorkspace {
+            monitor,
+            workspace: next,
+        })
+        .unwrap();
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        assert!(wm.floating_rect(window).is_some());
+        wm.remove_window(window);
+        assert_eq!(wm.floating_rect(window), None);
+    }
+
+    #[test]
+    fn floating_mode_restores_side_by_side_and_explicit_float_does_not_retile() {
+        let mut wm = WmState::new();
+        let monitor = wm.add_monitor();
+        let ws = WorkspaceId::FIRST;
+        let window = wm
+            .add_window(WindowOwner {
+                monitor,
+                workspace: ws,
+            })
+            .unwrap();
+        wm.execute(WmCommand::ToggleTilingMode { monitor }).unwrap();
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        let rect = Rect {
+            x: 40,
+            y: 60,
+            width: 550,
+            height: 410,
+        };
+        wm.ensure_workspace_float_rect(window, rect);
+        wm.execute(WmCommand::ToggleFocusedFloating {
+            monitor,
+            tiled_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1200,
+                height: 900,
+            },
+        })
+        .unwrap();
+        assert_eq!(wm.floating_rect(window), Some(rect));
+        wm.execute(WmCommand::ToggleFloatingMode { monitor })
+            .unwrap();
+        assert_eq!(wm.tiling_mode(monitor, ws), Some(TilingMode::SideBySide));
+        assert_eq!(wm.floating_windows(monitor, ws), Some(&[window][..]));
+        assert_eq!(wm.floating_rect(window), Some(rect));
+    }
 
     #[test]
     fn disconnect_migrates_every_workspace_to_survivor_and_preserves_floats() {
